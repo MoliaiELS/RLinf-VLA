@@ -75,10 +75,11 @@ def run_lane(args, job, output, code):
                 base = ["--robotwin-root", os.environ["FYP_ROBOTWIN_ROOT"], "--task", task, "--condition", condition,
                         "--phase", phase if smoke else "formal", "--output", str(output),
                         "--limit", str(1 if phase == "coverage" else 5 if smoke else 300 if task in PRIORITY else 100)]
-                model = ["--checkpoint", os.environ["FYP_ROBOTWIN_MODEL"]]
+                model = ["--checkpoint", os.environ["FYP_ROBOTWIN_MODEL"],
+                         "--xvla-root", os.environ["FYP_ROBOTWIN_XVLA"]]
                 steps = [("screen", []), ("eval", model + ["--batch", str(batch)])]
                 if args.mode == "smoke":
-                    steps.insert(1, ("parity", model + ["--xvla-root", os.environ["FYP_ROBOTWIN_XVLA"]]))
+                    steps.insert(1, ("parity", model))
                 ok = True
                 for step, opts in steps:
                     started = time.monotonic()
@@ -121,7 +122,7 @@ def probe_model(model_root):
     pinned_checkout(reference_root, protocol.XVLA_COMMIT)
     evidence = {"input": "fixed synthetic camera arrays and poses", "policy_seed": seed}
     with torch.inference_mode():
-        official, _ = reference_client(reference_root, policy, seed, policy.inputs(obs), evidence)
+        official = reference_client(reference_root, policy, seed, policy.inputs(obs), evidence)
         official.set_instruction(instruction)
         raw = policy.step(obs)
         official_raw = official.step(obs)
