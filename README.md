@@ -25,6 +25,8 @@
   <sub>RLinf: Reinforcement Learning Infrastructure for Embodied and Agentic AI</sub>
 </h1>
 
+> **RLinf-VLA · X-VLA (`codex/xvla`)** — Run the frozen X-VLA baseline on RoboTwin 2.0 Easy and Hard using the [IDAC setup and evaluation guide](docs/robotwin/README.md).
+
 RLinf is a flexible and scalable open-source RL infrastructure designed for Embodied and Agentic AI. The 'inf' in RLinf stands for `Infrastructure`, highlighting its role as a robust backbone for next-generation training. It also stands for `Infinite`, symbolizing the system’s support for open-ended learning, continuous generalization, and limitless possibilities in intelligence development.
 
 <div align="center">

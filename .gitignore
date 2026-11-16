@@ -23,3 +23,5 @@ rlinf/envs/sim/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+tools/idac/settings.local.psd1
+!tools/xvla/robotwin/requirements.txt
