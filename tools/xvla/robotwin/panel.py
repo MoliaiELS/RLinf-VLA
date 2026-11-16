@@ -35,7 +35,7 @@ def run(args):
     root = Path(os.environ["FYP_ROBOTWIN_DATA"])
     job = Path(os.environ["FYP_ROBOTWIN_JOB"])
     code = json.loads((job / "runtime.json").read_text())["code"]["repository"]["commit"]
-    output = root / "panels" / code
+    output = root / ("easy-preflight" if args.mode == "easy-preflight" else "panels") / code
     output.mkdir(parents=True, exist_ok=True)
     with (output / f"lane-{args.lane}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -44,8 +44,12 @@ def run(args):
 
 def run_lane(args, job, output, code):
     conditions = ("easy", "hard") if args.lane == "both" else (args.lane,)
-    smoke = args.mode in ("smoke", "coverage")
-    if args.mode == "smoke":
+    preflight = args.mode == "easy-preflight"
+    if preflight and conditions != ("easy",):
+        raise ValueError("Easy preflight requires --lane easy")
+    phase = "coverage" if preflight else args.mode
+    smoke = phase in ("smoke", "coverage")
+    if preflight or args.mode == "smoke":
         tasks = PRIORITY[:2]
     elif args.mode == "coverage":
         tasks = MISSING_IN_RLINF
@@ -69,8 +73,8 @@ def run_lane(args, job, output, code):
                 if args.task and task != args.task:
                     continue
                 base = ["--robotwin-root", os.environ["FYP_ROBOTWIN_ROOT"], "--task", task, "--condition", condition,
-                        "--phase", args.mode if smoke else "formal", "--output", str(output),
-                        "--limit", str(1 if args.mode == "coverage" else 5 if smoke else 300 if task in PRIORITY else 100)]
+                        "--phase", phase if smoke else "formal", "--output", str(output),
+                        "--limit", str(1 if phase == "coverage" else 5 if smoke else 300 if task in PRIORITY else 100)]
                 model = ["--checkpoint", os.environ["FYP_ROBOTWIN_MODEL"]]
                 steps = [("screen", []), ("eval", model + ["--batch", str(batch)])]
                 if args.mode == "smoke":
@@ -131,7 +135,7 @@ def probe_model(model_root):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["probe", "smoke", "coverage", "formal", "extension"])
+    parser.add_argument("mode", choices=["probe", "easy-preflight", "smoke", "coverage", "formal", "extension"])
     parser.add_argument("--lane", choices=["easy", "hard", "both"], default="both")
     parser.add_argument("--task")
     raise SystemExit(run(parser.parse_args()))

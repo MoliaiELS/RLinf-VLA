@@ -58,6 +58,14 @@ case "${1:?prepare mode}" in
         "$python" "$tool_dir/job_runtime.py" prepare-environment
         echo ROBOTWIN_SOURCES_READY
         ;;
+    easy-preflight)
+        exec 9>"$data/easy-preflight-prepare.lock"
+        flock 9
+        source_checkout="$code/RoboTwin-$ROBOTWIN_REV"
+        robot="$code/RoboTwin-easy-preflight-$ROBOTWIN_REV"
+        checkout "$source_checkout" "$ROBOTWIN_REV" "$robot"
+        FYP_ROBOTWIN_ROOT="$robot" "$python" "$tool_dir/job_runtime.py" prepare-easy-assets
+        ;;
     link)
         robot="$(realpath "$code/RoboTwin-$ROBOTWIN_REV")"
         tree="$input_root/sim-assets/$ASSETS_REV"

@@ -94,7 +94,7 @@ echo ROBOTWIN_DOWNLOAD_PID=`$!
 "@
     }
     'robotwin-prepare' {
-        if ($Value -notin @('env','assets','link')) { throw 'Requires env, assets, or link' }
+        if ($Value -notin @('env','assets','link','easy-preflight')) { throw 'Requires env, assets, link, or easy-preflight' }
         if ($Value -eq 'assets' -and $cfg.InputRoot -ne $cfg.DataRoot) { throw 'Shared InputRoot is read-only. Download assets from its owning checkout.' }
         Invoke-Remote @"
 test -f '$toolDir/prepare.sh'
@@ -104,7 +104,8 @@ echo ROBOTWIN_PREPARE_PID=`$!
 "@
     }
     'robotwin-submit' {
-        if ($Value -notin @('probe','smoke','coverage','formal','extension')) { throw 'Requires probe, smoke, coverage, formal, or extension' }
+        if ($Value -notin @('probe','easy-preflight','smoke','coverage','formal','extension')) { throw 'Requires probe, easy-preflight, smoke, coverage, formal, or extension' }
+        if ($Value -eq 'easy-preflight' -and $RobotLane -ne 'easy') { throw 'Easy preflight requires -RobotLane easy' }
         Invoke-Remote "bash '$toolDir/submit.sh' '$Value' '$($cfg.Partition)' '$GpuModel' '$RobotLane' '$RobotHours' '$RobotTask'"
     }
     'robotwin-run' {
@@ -126,7 +127,7 @@ done
 '@
     }
     'robotwin-logs' {
-        if ($Value -notmatch '^(\d+|prepare-(env|assets|link)|download-robotwin)$') { throw 'Requires a job ID or preparation log name' }
+        if ($Value -notmatch '^(\d+|prepare-(env|assets|link|easy-preflight)|download-robotwin)$') { throw 'Requires a job ID or preparation log name' }
         Invoke-Remote "for ext in log out err; do if test -f '$($cfg.DataRoot)/logs/$Value'.`$ext; then tail -n 45 '$($cfg.DataRoot)/logs/$Value'.`$ext; fi; done"
     }
     'robotwin-report' {

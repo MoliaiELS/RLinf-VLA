@@ -4,10 +4,13 @@ import hashlib
 from importlib import metadata
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
 
 QUALIFIED_VERSIONS = {
@@ -20,6 +23,11 @@ QUALIFIED_VERSIONS = {
     "warp-lang": "1.6.0",
     "numpy": "1.26.3",
     "scipy": "1.15.0",
+}
+EASY_TASKS = ("move_stapler_pad", "turn_switch")
+EASY_ASSET_MEMBERS = {
+    "embodiments.zip": ("embodiments/aloha-agilex/",),
+    "objects.zip": ("objects/048_stapler/", "objects/056_switch/", "objects/objaverse/list.json", "objects/same.json"),
 }
 
 
@@ -138,19 +146,109 @@ def receipt(path, expected, *, verify_all=False):
     return {"path": str(path), **obj}
 
 
-def asset_receipt(inputs, revision, *, verify_all=False):
+def assets_spec():
     if __package__:
         from .download_assets import ARCHIVES, REPO
     else:
         from download_assets import ARCHIVES, REPO
+    return ARCHIVES, REPO
+
+
+def asset_receipt(inputs, revision, *, verify_all=False):
+    archives, repo_id = assets_spec()
 
     if not (inputs / "sim-assets" / revision / ".extracted").is_file():
         raise ValueError(f"Pinned simulator assets have not finished extracting under {inputs}")
     assets = receipt(inputs / "archives" / revision, revision, verify_all=verify_all)
     recorded = {item["file"]: (item["bytes"], item["sha256"]) for item in assets["files"]}
-    if assets["repo_id"] != REPO or recorded != ARCHIVES:
+    if assets["repo_id"] != repo_id or recorded != archives:
         raise ValueError(f"Unexpected simulator archive checksums: {assets['path']}")
     return assets
+
+
+def early_link_paths(robot, root):
+    return [(robot / "assets" / name, root / name) for name in ("objects", "embodiments")]
+
+
+def early_asset_receipt(root, robot, revision):
+    qualification = json.loads((root / "qualification.json").read_text())
+    archives, repo_id = assets_spec()
+    expected = {name: archives[name] for name in EASY_ASSET_MEMBERS}
+    recorded = {row["file"]: (row["bytes"], row["sha256"]) for row in qualification["archives"]}
+    if (qualification["revision"] != revision or qualification["repo_id"] != repo_id
+            or qualification["condition"] != "easy" or qualification["tasks"] != list(EASY_TASKS)
+            or qualification["robotwin_root"] != str(robot) or recorded != expected):
+        raise ValueError(f"Unexpected Easy preflight qualification: {root}")
+    for link, target in early_link_paths(robot, root):
+        if not link.is_dir() or link.resolve() != target or not link.is_symlink():
+            raise ValueError(f"Wrong isolated asset link: {link}")
+    for file, checksum in qualification["planner_yaml_sha256"].items():
+        path = root / "embodiments/aloha-agilex" / file
+        if digest(path) != checksum:
+            raise ValueError(f"Easy preflight planner configuration differs: {path}")
+    return qualification
+
+
+def prepare_easy_assets(data, inputs, revision, robot):
+    parent = data / "easy-preflight-inputs"
+    root = parent / revision
+    parent.mkdir(parents=True, exist_ok=True)
+    if not root.resolve().is_relative_to(data):
+        raise ValueError(f"Easy preflight asset target escapes output root: {root}")
+    if root.exists():
+        early_asset_receipt(root, robot, revision)
+        print(f"ROBOTWIN_EASY_PREFLIGHT_READY {root}", flush=True)
+        return
+
+    archives, repo_id = assets_spec()
+    checked = []
+    with TemporaryDirectory(prefix=".prepare-", dir=parent) as tmp:
+        stage = Path(tmp) / revision
+        stage.mkdir()
+        for name, members in EASY_ASSET_MEMBERS.items():
+            path = inputs / "archives" / revision / name
+            size, checksum = archives[name]
+            if path.stat().st_size != size or digest(path) != checksum:
+                raise ValueError(f"Easy preflight requires the full verified archive {path}")
+            files = 0
+            with ZipFile(path) as archive:
+                for member in archive.infolist():
+                    if not any(member.filename.startswith(spec) if spec.endswith("/") else member.filename == spec
+                               for spec in members):
+                        continue
+                    relative = PurePosixPath(member.filename)
+                    if relative.is_absolute() or ".." in relative.parts or stat.S_ISLNK(member.external_attr >> 16):
+                        raise ValueError(f"Unexpected asset archive member: {member.filename}")
+                    archive.extract(member, stage)
+                    files += not member.is_dir()
+            checked.append({"file": name, "path": str(path), "bytes": size, "sha256": checksum, "files": files})
+
+        required = ("objects/same.json", "objects/objaverse/list.json", "objects/048_stapler/model_data0.json",
+                    "objects/056_switch/points_info.json", "embodiments/aloha-agilex/config.yml")
+        for name in required:
+            if not (stage / name).is_file():
+                raise ValueError(f"Easy preflight asset missing from verified archives: {name}")
+        aloha = stage / "embodiments/aloha-agilex"
+        generated = {}
+        for arm in ("left", "right"):
+            # Reproduce the pinned RoboTwin template substitution in the
+            # staging tree before exposing either arm configuration.
+            template = (aloha / f"curobo_{arm}_tmp.yml").read_text()
+            file = aloha / f"curobo_{arm}.yml"
+            file.write_text(template.replace("${ASSETS_PATH}", str(robot)).replace("$ASSETS_PATH", str(robot)))
+            generated[file.name] = digest(file)
+
+        for link, target in early_link_paths(robot, root):
+            if not link.exists() and not link.is_symlink():
+                link.symlink_to(target, target_is_directory=True)
+            if not link.is_symlink() or link.resolve() != target:
+                raise ValueError(f"Refusing to replace the existing asset path: {link}")
+        qualification = dict(repo_id=repo_id, revision=revision, archives=checked, condition="easy",
+                             tasks=list(EASY_TASKS), robotwin_root=str(robot), planner_yaml_sha256=generated)
+        (stage / "qualification.json").write_text(json.dumps(qualification, indent=2) + "\n")
+        stage.replace(root)
+    early_asset_receipt(root, robot, revision)
+    print(f"ROBOTWIN_EASY_PREFLIGHT_READY {root}", flush=True)
 
 
 def main(mode):
@@ -159,6 +257,9 @@ def main(mode):
     rev = dict(line.split("=", 1) for line in Path(__file__).with_name("runtime.env").read_text().splitlines())
     if mode == "prepare-environment":
         prepare_environment(data)
+        return
+    if mode == "prepare-easy-assets":
+        prepare_easy_assets(data, inputs, rev["ASSETS_REV"], Path(os.environ["FYP_ROBOTWIN_ROOT"]).resolve())
         return
     if mode == "verify-assets":
         assets = asset_receipt(inputs, rev["ASSETS_REV"], verify_all=True)
@@ -192,7 +293,7 @@ def main(mode):
     device = f"pci:{match[1]}:{match[2]}.{match[3]}"
     (out / "vulkan-device.txt").write_text(device + "\n")
     repo = Path(__file__).resolve().parents[3]
-    robot = Path(os.environ["FYP_ROBOTWIN_ROOT"])
+    robot = Path(os.environ["FYP_ROBOTWIN_ROOT"]).resolve()
     code_paths = {name: path for name, path in (
         ("ROBOTWIN", robot),
         ("XVLA", Path(os.environ["FYP_ROBOTWIN_XVLA"])), ("CUROBO", Path(os.environ["FYP_ROBOTWIN_CUROBO"])),
@@ -213,11 +314,14 @@ def main(mode):
                     camera=dict(sensor="D435", near_m=0.1, far_m=100, shader="rt", samples=32),
                     configs={str(f.relative_to(robot)): digest(f) for f in files})
     if mode != "probe":
-        assets = asset_receipt(inputs, rev["ASSETS_REV"])
-        if inputs != data:
-            verified = json.loads((data / "evidence/shared-assets-verified.json").read_text())
-            if assets != verified:
-                raise ValueError(f"Shared simulator assets differ from the verified snapshot at {inputs}")
+        if mode == "easy-preflight":
+            assets = early_asset_receipt(data / "easy-preflight-inputs" / rev["ASSETS_REV"], robot, rev["ASSETS_REV"])
+        else:
+            assets = asset_receipt(inputs, rev["ASSETS_REV"])
+            if inputs != data:
+                verified = json.loads((data / "evidence/shared-assets-verified.json").read_text())
+                if assets != verified:
+                    raise ValueError(f"Shared simulator assets differ from the verified snapshot at {inputs}")
         embodiment = robot / "assets/embodiments/aloha-agilex"
         manifest.update(assets=assets,
                         embodiment={f.name: digest(f) for f in sorted(embodiment.glob("*.yml"))},

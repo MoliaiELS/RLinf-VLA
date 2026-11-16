@@ -11,8 +11,14 @@ flock 9
 test -s "$data/evidence/build.complete"
 if [[ "$mode" != probe ]]; then
     test -s "$input/models/X-VLA-RoboTwin2--${MODEL_REV:0:12}/verified.json"
+    robot="$FYP_ROBOTWIN_CODE/RoboTwin-$ROBOTWIN_REV"
+    if [[ "$mode" == easy-preflight ]]; then
+        test "$lane" = easy
+        test -s "$data/easy-preflight-inputs/$ASSETS_REV/qualification.json"
+        robot="$FYP_ROBOTWIN_CODE/RoboTwin-easy-preflight-$ROBOTWIN_REV"
+    fi
     for arm in left right; do
-        test -s "$FYP_ROBOTWIN_CODE/RoboTwin-$ROBOTWIN_REV/assets/embodiments/aloha-agilex/curobo_${arm}.yml"
+        test -s "$robot/assets/embodiments/aloha-agilex/curobo_${arm}.yml"
     done
 fi
 # Count assigned and requested GPUs across the user's experiments.
