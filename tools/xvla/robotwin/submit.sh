@@ -23,7 +23,7 @@ if [[ "$mode" != probe ]]; then
 fi
 # Count assigned and requested GPUs across the user's experiments.
 own="$(squeue -h -u "$(id -un)" -o '%b')"
-own_gpus="$(awk 'BEGIN {n=0} {for (i=1;i<=NF;i++) if ($i ~ /^gres:gpu(:[[:alnum:]_-]+)?:[0-9]+$/) {split($i,a,":"); n+=a[length(a)]}} END{print n}' <<< "${own//,/ }")"
+own_gpus="$(awk 'BEGIN {n=0} {for (i=1;i<=NF;i++) if ($i ~ /^gres[/:]gpu(:[[:alnum:]_-]+)?:[0-9]+$/) {split($i,a,":"); n+=a[length(a)]}} END{print n}' <<< "${own//,/ }")"
 if (( own_gpus >= 2 )); then echo 'Two own GPUs are already allocated or requested' >&2; exit 1; fi
 job_args=("$mode" --lane "$lane")
 if [[ -n "$task" ]]; then job_args+=(--task "$task"); fi

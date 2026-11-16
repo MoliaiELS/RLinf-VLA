@@ -8,6 +8,8 @@
 
 背景纹理仍在下载时，可以用已核验的物体和机器人资产提前检查 Easy 的 `move_stapler_pad`、`turn_switch` 各一回合。`robotwin-prepare easy-preflight` 在独立目录准备资产，再用 `robotwin-submit easy-preflight -RobotLane easy` 提交。结果写入 `easy-preflight/`，只用于运行验收。
 
+固定输入的模型接口对齐作业 `20303` 已通过。作者接口和本地推理的 `30×20` 动作张量最大绝对差为 `0`。真实 Easy 预检 `20304` 已完成，两个任务分别在 124 和 122 个动作锚点通过官方成功判定。每个任务保留专家筛选记录、策略回合日志和视频。正式回合计数仍由原实验派发器登记。
+
 任务目录列出官方 50 项任务的分类、成功判定和覆盖状态。X‑VLA 作者报告的公开成绩为 Easy 70.0%、Hard 39.0%。 [任务目录](task-catalog.md) [作者 README](https://github.com/2toinf/X-VLA/blob/6c4ecfb8be458ae7c0c96094e4b0add4174f4fe2/evaluation/robotwin-2.0/README.md) [逐任务参考](https://arxiv.org/html/2510.10274v1#A13.T16)
 
 ## 固定身份和实验定义
