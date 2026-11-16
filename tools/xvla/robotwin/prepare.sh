@@ -103,15 +103,15 @@ case "${1:?prepare mode}" in
             if [[ ! -e "$link" && ! -L "$link" ]]; then ln -s "$target" "$link"; fi
             test "$(realpath "$link")" = "$(realpath "$target")"
         done
-        if [[ ! -f "$embodiment_root/.config-root" ]]; then
+        if [[ -f "$embodiment_root/.config-root" ]]; then
+            test "$(cat "$embodiment_root/.config-root")" = "$robot"
+        else
             (cd "$robot" && "$python" script/update_embodiment_config_path.py)
-            for planner in curobo curobo_left curobo_right; do
-                test -s "$robot/assets/embodiments/aloha-agilex/$planner.yml"
-            done
-            printf '%s\n' "$robot" > "$embodiment_root/.config-root"
         fi
-        test "$(cat "$embodiment_root/.config-root")" = "$robot"
-        test -s "$robot/assets/embodiments/aloha-agilex/curobo.yml"
+        for arm in left right; do
+            test -s "$robot/assets/embodiments/aloha-agilex/curobo_${arm}.yml"
+        done
+        printf '%s\n' "$robot" > "$embodiment_root/.config-root"
         echo ROBOTWIN_LINK_READY
         ;;
     *) exit 2 ;;
