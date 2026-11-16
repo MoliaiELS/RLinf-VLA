@@ -99,24 +99,34 @@ def run_lane(args, job, output, code):
 
 
 def probe_model(model_root):
-    # Model-only forward check while simulator assets download. This does not
-    # serve as a parity, observation, action execution, or success check.
     import numpy as np
     import torch
     from tools.xvla.robotwin import protocol
-    from tools.xvla.robotwin.runner import checkpoint
+    from tools.xvla.robotwin.parity import reference_client
+    from tools.xvla.robotwin.runner import checkpoint, pinned_checkout
 
     policy, _ = checkpoint(model_root, "cuda:0", True)
-    rgb = np.zeros(protocol.RGB_SHAPE, dtype=np.uint8)
-    obs = {"observation": {camera: {"rgb": rgb} for camera in protocol.CAMERAS},
-           "endpose": {f"{side}_{key}": value for side in ("left", "right")
-                       for key, value in (("endpose", [0., 0., 0., 1., 0., 0., 0.]), ("gripper", 0.5))}}
-    policy.begin("move stapler pad", 0)
+    images = np.random.default_rng(0)
+    obs = {"observation": {camera: {"rgb": images.integers(0, 256, protocol.RGB_SHAPE, dtype=np.uint8)}
+                           for camera in (*protocol.CAMERAS, "front_camera")},
+           "endpose": {"left_endpose": [0.1, 0.2, 0.3, 1., 0., 0., 0.], "left_gripper": 0.5,
+                       "right_endpose": [-0.1, 0.3, 0.2, 0.5, 0.5, 0.5, -0.5], "right_gripper": 0.8}}
+    instruction, seed = "move stapler pad", 0
+    policy.begin(instruction, seed)
+    reference_root = Path(os.environ["FYP_ROBOTWIN_XVLA"])
+    pinned_checkout(reference_root, protocol.XVLA_COMMIT)
+    evidence = {"input": "fixed synthetic camera arrays and poses", "policy_seed": seed}
     with torch.inference_mode():
+        official, _ = reference_client(reference_root, policy, seed, policy.inputs(obs), evidence)
+        official.set_instruction(instruction)
         raw = policy.step(obs)
-    env = protocol.actions_to_env(raw)
-    assert np.isfinite(raw).all() and env.shape == (30, 16)
-    print(f"ROBOTWIN_MODEL_PROBE raw={raw.shape} ee={env.shape} peak_allocated={torch.cuda.max_memory_allocated()}", flush=True)
+        official_raw = official.step(obs)
+    np.testing.assert_allclose(raw, official_raw, rtol=1e-5, atol=1e-6)
+    commands = protocol.actions_to_env(raw)
+    evidence.update(raw_shape=raw.shape, ee_shape=commands.shape,
+                    raw_max_abs_diff=float(np.max(np.abs(raw - official_raw))),
+                    peak_allocated_bytes=torch.cuda.max_memory_allocated())
+    print("ROBOTWIN_MODEL_PROBE " + json.dumps(evidence), flush=True)
 
 
 if __name__ == "__main__":

@@ -86,7 +86,7 @@ case "${1:?prepare mode}" in
                 archive="$input_root/archives/$ASSETS_REV/embodiments.zip"
                 echo "6b87d7d55e106d8ff25917e0538eb1e177fc549280e8a742a8cec3cb9f953fc6  $archive" | sha256sum --check --status
                 staging="$(mktemp -d "$private_tree/.embodiments.XXXXXXXX")"
-                unzip -q "$archive" -d "$staging"
+                unzip -q "$archive" 'embodiments/*' -d "$staging"
                 test -d "$staging/embodiments"
                 printf '%s\n' "$ASSETS_REV" > "$staging/embodiments/.archive-revision"
                 mv -T -- "$staging/embodiments" "$embodiment_root"
