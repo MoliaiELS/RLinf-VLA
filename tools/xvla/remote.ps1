@@ -4,6 +4,7 @@ param(
     [Parameter(Position=1)][string]$Value='',
     [ValidateSet('robotwin')][string]$Model='robotwin',
     [ValidatePattern('^[0-9a-f]{40}$')][string]$RobotCommit,
+    [ValidatePattern('^(/[A-Za-z0-9_.-]+)+$')][string]$PilotEvaluationRoot,
     [ValidateSet('easy','hard','both')][string]$RobotLane='both',
     [ValidateSet('4090','3090')][string]$GpuModel='4090',
     [ValidatePattern('^[a-z0-9_]+$')][string]$RobotTask,
@@ -104,9 +105,12 @@ echo ROBOTWIN_PREPARE_PID=`$!
 "@
     }
     'robotwin-submit' {
-        if ($Value -notin @('probe','easy-preflight','smoke','coverage','formal','extension')) { throw 'Requires probe, easy-preflight, smoke, coverage, formal, or extension' }
+        if ($Value -notin @('probe','easy-preflight','smoke','coverage','formal','extension','concurrency-pilot')) { throw 'Requires probe, easy-preflight, smoke, coverage, formal, extension, or concurrency-pilot' }
         if ($Value -eq 'easy-preflight' -and $RobotLane -ne 'easy') { throw 'Easy preflight requires -RobotLane easy' }
-        Invoke-Remote "bash '$toolDir/submit.sh' '$Value' '$($cfg.Partition)' '$GpuModel' '$RobotLane' '$RobotHours' '$RobotTask'"
+        if ($Value -eq 'concurrency-pilot' -and (!$PilotEvaluationRoot -or $PilotEvaluationRoot -match '/\.\.?(/|$)' -or $RobotLane -ne 'easy' -or $RobotHours -ne 1 -or $GpuModel -ne '4090' -or $RobotTask)) {
+            throw 'Concurrency pilot needs -PilotEvaluationRoot, -RobotLane easy, -RobotHours 1 and a 4090'
+        }
+        Invoke-Remote "bash '$toolDir/submit.sh' '$Value' '$($cfg.Partition)' '$GpuModel' '$RobotLane' '$RobotHours' '$RobotTask' '$PilotEvaluationRoot'"
     }
     'robotwin-run' {
         if ($Value -and $Value -notmatch '^\d+$') { throw 'Build job ID must be numeric' }

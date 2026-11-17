@@ -43,5 +43,27 @@ python -u "$tool_dir/job_runtime.py" "$mode"
 export FYP_ROBOTWIN_VULKAN_DEVICE="$(cat "$FYP_ROBOTWIN_JOB/vulkan-device.txt")"
 python -u "$repo/tools/xvla/resource_monitor.py" &
 monitor_pid=$!
-trap 'kill -TERM "$monitor_pid" 2>/dev/null || true; wait "$monitor_pid" || true' EXIT
+util_pid=
+cleanup() {
+    if [[ -n "$util_pid" ]]; then
+        kill -TERM "$util_pid" 2>/dev/null || true
+        wait "$util_pid" || true
+    fi
+    kill -TERM "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" || true
+}
+trap cleanup EXIT
+if [[ "$mode" == concurrency-pilot ]]; then
+    evaluation_root="${1:?pinned evaluation root required}"
+    qualified_data="${FYP_ROBOTWIN_QUALIFIED_DATA:?qualified Easy panel root required}"
+    input_panel="$qualified_data/panels/$(git -C "$evaluation_root" rev-parse HEAD)"
+    gpu_uuid="$(python -c 'import json, sys; print("GPU-" + json.load(open(sys.argv[1]))[0])' "$FYP_ROBOTWIN_JOB/allocated_gpu_uuids.json")"
+    nvidia-smi --id="$gpu_uuid" --query-gpu=timestamp,uuid,memory.used,utilization.gpu,utilization.memory,power.draw \
+        --format=csv --loop-ms=2000 > "$FYP_ROBOTWIN_JOB/gpu-utilization.csv" &
+    util_pid=$!
+    python -u "$tool_dir/concurrency_pilot.py" --evaluation-root "$evaluation_root" \
+        --input-panel "$input_panel" --output "$FYP_ROBOTWIN_JOB/concurrency-pilot" \
+        --robotwin-root "$FYP_ROBOTWIN_ROOT" --xvla-root "$FYP_ROBOTWIN_XVLA" --checkpoint "$FYP_ROBOTWIN_MODEL"
+    exit
+fi
 python -u "$tool_dir/panel.py" "$mode" "$@"

@@ -38,6 +38,8 @@
 
 服务器 `DataRoot` 指向本分支的 RoboTwin 结果目录，例如个人数据目录下的 `RLinf/xvla/robotwin-native/`。它保存 `jobs/<jobid>/runtime.json`、`logs/`、`panels/<项目提交>/<阶段>/<任务>/<条件>/` 和 `reports/`。`InputRoot` 提供 `archives/`、`models/` 和解包后的 `sim-assets/`，默认使用 `DataRoot`。项目代码位于个人 homes。每个作业的 `runtime.json` 记录 GPU、驱动、依赖、代码和配置哈希。每个任务和条件保存模型与初态清单、协议指纹、逐回合记录、对齐证据和视频。
 
+单卡并发短测在固定的 `9baa17360abe242cb36e8f9c78f0aadbe64b3bee` 评测工作树上运行。它复制两项 Easy smoke 的冻结初态，分别以串行和同一 RTX 4090 上的两个进程各执行 10 个回合。短测输出保存在 `jobs/<jobid>/concurrency-pilot/`，包括各轮结果、规划失败、物理步数、耗时和总吞吐；同级 `gpu-utilization.csv` 每两秒采样一次。通过 `robotwin-submit concurrency-pilot -RobotLane easy -RobotHours 1 -PilotEvaluationRoot <服务器固定评测路径>` 提交。该测试保留正式评测的策略和仿真配置，直接比较评测吞吐；专家预筛并发单独验证。
+
 旧仓库的派发状态和固定执行提交见运行登记，结果在 `RLinf/xvla/robotwin-b0/`。本分支使用独立结果目录，后续正式作业按本分支执行提交的探针及 smoke 证据验收。 [旧评测运行登记](https://github.com/MoliaiELS/continual-vla-rl/blob/codex/xvla-integration/docs/robotwin/status.md)
 
 ## 执行与恢复
