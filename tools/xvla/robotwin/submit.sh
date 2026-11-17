@@ -33,7 +33,7 @@ if [[ "$mode" == concurrency-pilot ]]; then
     test -z "$task"
     test "$gpu" = 4090
     test "$hours" = 1
-    test -x "${evaluation_root:?pinned evaluation root required}/tools/xvla/robotwin/job.sh"
+    test -r "${evaluation_root:?pinned evaluation root required}/tools/xvla/robotwin/runner.py"
     job_args+=("$evaluation_root")
     cpus=16
 else
