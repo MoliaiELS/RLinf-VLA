@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from . import protocol as p
 from .official_rollout import CLIENT_SHA256, execute, load_official_rollout
+from .prescreen_failures import expert_failure_reason
 
 
 HERE = Path(__file__).resolve().parent
@@ -309,6 +310,22 @@ def reset_env(env, cfg, index, seed, budget=None):
         budget.timestep_seconds = float(env.scene.get_timestep())
 
 
+def screen_expert(env, task):
+    try:
+        env.play_once()
+    except Exception as error:
+        reason = expert_failure_reason(env, task, error)
+        if reason is None:
+            raise
+        return {"status": "excluded", "reason": reason, "expert_exception": type(error).__name__,
+                "traceback": traceback.format_exc()}
+    if not env.plan_success:
+        return {"status": "excluded", "reason": "expert_plan_failed"}
+    if not env.check_success():
+        return {"status": "excluded", "reason": "expert_success_false"}
+    return None
+
+
 def screen(args, shard, header, cls, cfg):
     from envs.utils.create_actor import UnStableError
 
@@ -345,11 +362,9 @@ def screen(args, shard, header, cls, cfg):
             reset_env(env, cfg, len(accepted), seed)
             scene = scene_values(env)
             signature = digest(scene)
-            env.play_once()
-            if not env.plan_success:
-                result = {"status": "excluded", "reason": "expert_plan_failed"}
-            elif not env.check_success():
-                result = {"status": "excluded", "reason": "expert_success_false"}
+            rejection = screen_expert(env, args.task)
+            if rejection is not None:
+                result = rejection
             elif signature in seen:
                 result = {"status": "excluded", "reason": "duplicate_initial_scene"}
             else:
@@ -583,7 +598,7 @@ def main():
         pinned_checkout(args.xvla_root, p.XVLA_COMMIT)
     config_hashes = {name: sha256(args.robotwin_root / name) for name in FILES}
     files = ("runner.py", "protocol.py", "official_rollout.py", "parity.py", "bind_renderer.py", "runtime.env",
-             "requirements.txt")
+             "requirements.txt", "prescreen_failures.py")
     source_hashes = {name: sha256(HERE / name) for name in files}
     basis = dict(robotwin_commit=p.ROBOTWIN_COMMIT, xvla_commit=p.XVLA_COMMIT, rlinf_commit=p.RLINF_COMMIT,
                  model_id=p.MODEL_ID, model_revision=p.MODEL_REVISION, config_sha256=config_hashes,
