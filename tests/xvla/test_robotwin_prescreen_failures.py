@@ -5,6 +5,7 @@ import unittest
 
 from tools.xvla.robotwin.prescreen_failures import (
     EXPERT_GRASP_POSE_UNAVAILABLE,
+    EXPERT_PLAN_FAILED_EMPTY_GRASP,
     expert_failure_reason,
 )
 
@@ -69,3 +70,38 @@ class ExpertPrescreenFailuresTest(unittest.TestCase):
             self.assertIsNone(reason(env, "lift_pot"))
             env.no_pose = False
             self.assertIsNone(reason(env, "click_alarmclock"))
+
+    def test_dustbin_empty_grasp_requires_the_known_site_and_failed_plan(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            env = load_fixture(root, "envs/put_bottles_dustbin.py", '''
+                class Fixture:
+                    def grasp_actor(self, *args, **kwargs):
+                        return self.grasp
+
+                    def play_once(self):
+                        bottle, arm_tag, delta_dis = None, "right", 0.06
+                        if self.side == "right":
+                            right_action = self.grasp_actor(bottle, arm_tag=arm_tag, pre_grasp_dis=0.1)
+                            right_action[1][0].target_pose[2] += delta_dis
+                        elif self.side == "left":
+                            left_action = self.grasp_actor(bottle, arm_tag="left", pre_grasp_dis=0.1)
+                            left_action[1][0].target_pose[2] -= delta_dis
+                        else:
+                            self.grasp[1][0].target_pose[2] -= delta_dis
+            ''')()
+            env.plan_success = False
+            env.grasp = (None, [])
+            for side in ("left", "right"):
+                with self.subTest(side=side):
+                    env.side = side
+                    self.assertEqual(reason(env, "put_bottles_dustbin"), EXPERT_PLAN_FAILED_EMPTY_GRASP)
+            self.assertIsNone(reason(env, "lift_pot"))
+            env.plan_success = True
+            self.assertIsNone(reason(env, "put_bottles_dustbin"))
+            env.plan_success = False
+            env.grasp = ("right", [])
+            self.assertIsNone(reason(env, "put_bottles_dustbin"))
+            env.grasp = (None, [])
+            env.side = "other"
+            self.assertIsNone(reason(env, "put_bottles_dustbin"))
