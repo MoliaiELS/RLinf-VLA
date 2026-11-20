@@ -108,6 +108,12 @@ def _child(config_path: str, seed: int, mode: str, folder: str) -> None:
     destination = Path(folder).resolve()
     destination.mkdir(parents=True, exist_ok=False)
     torch.manual_seed(1234)
+    if os.environ.get("XVLA_LOGIN_DIAGNOSTIC") == "1":
+        budget = int(os.environ.get("XVLA_LOGIN_MAX_TORCH_GIB", "10")) * 1024**3
+        total = torch.cuda.get_device_properties(0).total_memory
+        if not 0 < budget <= total:
+            raise ValueError("Invalid login diagnostic PyTorch memory budget")
+        torch.cuda.set_per_process_memory_fraction(budget / total, 0)
     env_cfg = OmegaConf.create(OmegaConf.to_container(cfg.env.train, resolve=True))
     env_cfg.group_size = 1
     env_cfg.total_num_envs = 1

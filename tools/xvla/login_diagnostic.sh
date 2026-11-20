@@ -29,6 +29,9 @@ test -r "$model_path/verified.json"
 source "$prefix/bin/activate"
 export USER="$(id -un)" LOGNAME="$(id -un)"
 export XVLA_LOGIN_DIAGNOSTIC=1 XVLA_RUN_DIR="$output"
+export XVLA_LOGIN_SHARE_FREE_CAPACITY="${XVLA_LOGIN_SHARE_FREE_CAPACITY:-0}"
+[[ "$XVLA_LOGIN_SHARE_FREE_CAPACITY" == 0 || "$XVLA_LOGIN_SHARE_FREE_CAPACITY" == 1 ]]
+export XVLA_LOGIN_MAX_TORCH_GIB=10
 export ROBOTWIN_PATH="$robotwin_root" XVLA_MODEL_PATH="$model_path"
 export CUDA_VISIBLE_DEVICES="$gpu_uuid" PYTHONPATH="$repo"
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -57,6 +60,7 @@ import time
 
 repo, commit, requested = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 root = pathlib.Path(os.environ["XVLA_RUN_DIR"])
+share_free_capacity = os.environ["XVLA_LOGIN_SHARE_FREE_CAPACITY"] == "1"
 if socket.gethostname() != "4090node1" or "SLURM_JOB_ID" in os.environ:
     raise RuntimeError("Login diagnostics require 4090node1 outside Slurm")
 cpus = sorted(os.sched_getaffinity(0))[:4]
@@ -71,18 +75,35 @@ def query(arguments):
     ).splitlines()))
 
 def idle_gpu():
-    rows = query([f"--id={requested}", "--query-gpu=uuid,pci.bus_id,memory.used,name"])
-    if len(rows) != 1 or len(rows[0]) != 4:
+    rows = query([f"--id={requested}", "--query-gpu=uuid,pci.bus_id,memory.used,memory.free,name"])
+    if len(rows) != 1 or len(rows[0]) != 5:
         raise RuntimeError(f"Expected exactly one GPU for {requested}: {rows}")
-    uuid, pci, used, name = (value.strip() for value in rows[0])
-    if uuid.lower() != requested.lower() or int(used) >= 256:
-        raise RuntimeError(f"Requested GPU is not idle: {rows[0]}")
-    processes = query(["--query-compute-apps=gpu_uuid,pid"])
-    pids = [int(row[1]) for row in processes if row and row[0].strip().lower() == uuid.lower()]
-    if pids:
-        raise RuntimeError(f"Requested GPU has existing compute processes: {pids}")
+    uuid, pci, used, free, name = (value.strip() for value in rows[0])
+    if uuid.lower() != requested.lower():
+        raise RuntimeError(f"Requested GPU UUID does not match: {rows[0]}")
+    processes = query(["--query-compute-apps=gpu_uuid,pid,used_gpu_memory"])
+    pids, foreign = [], []
+    for row in processes:
+        if not row or row[0].strip().lower() != uuid.lower():
+            continue
+        pid = int(row[1])
+        try:
+            group = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        pids.append(pid)
+        if group != os.getpgrp():
+            foreign.append({"pid": pid, "memory_used_mib": int(row[2])})
+    foreign_memory = sum(process["memory_used_mib"] for process in foreign)
+    if share_free_capacity:
+        if int(free) < 16 * 1024 or foreign_memory > 6 * 1024:
+            raise RuntimeError(f"Insufficient shared GPU capacity: free={free} MiB, foreign={foreign_memory} MiB")
+    elif int(used) >= 256 or pids:
+        raise RuntimeError(f"Requested GPU is not idle: used={used} MiB, compute_pids={pids}")
     return {"uuid": uuid, "pci_bus_id": pci, "memory_used_mib": int(used),
-            "name": name, "compute_pids": pids, "checked_epoch": time.time()}
+            "memory_free_mib": int(free), "name": name, "compute_pids": pids,
+            "foreign_compute_processes": foreign, "foreign_compute_memory_mib": foreign_memory,
+            "checked_epoch": time.time()}
 
 first_check = idle_gpu()
 import torch
@@ -114,8 +135,10 @@ record = {
     "time_limit_seconds": 1200, "term_after_seconds": 1185, "kill_after_seconds": 15,
     "cuda_visible_devices": requested, "gpu_uuid": uuid, "gpu_model": properties.name,
     "vulkan_device": vulkan, "gpu_idle_checks": [first_check, last_check],
+    "share_free_capacity": share_free_capacity, "max_torch_memory_gib": 10,
+    "gpu_preflight_policy": "shared_free_capacity" if share_free_capacity else "idle_only",
     "cpu_affinity": cpus, "threads": 4, "nice": os.getpriority(os.PRIO_PROCESS, 0),
-    "process_group": os.getpgrp(), "gpu_watch_interval_seconds": 10,
+    "process_group": os.getpgrp(), "gpu_watch_interval_seconds": 1 if share_free_capacity else 10,
 }
 with (root / "login-runtime.json").open("x") as stream:
     json.dump(record, stream, indent=2)
@@ -126,9 +149,10 @@ with (root / "login-runtime.json").open("x") as stream:
 watcher = r'''
 import csv, json, os, pathlib, signal, subprocess, sys, time
 uuid, parent, group, output = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), pathlib.Path(sys.argv[4])
+shared = os.environ["XVLA_LOGIN_SHARE_FREE_CAPACITY"] == "1"
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 while True:
-    time.sleep(10)
+    time.sleep(1 if shared else 10)
     reason = None
     try:
         if os.getpgid(parent) != group:
@@ -137,7 +161,7 @@ while True:
         reason = "diagnostic_parent_exited"
     if reason is None:
         try:
-            text = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"], text=True, timeout=5)
+            text = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_gpu_memory", "--format=csv,noheader,nounits"], text=True, timeout=5)
             foreign = []
             for row in csv.reader(text.splitlines()):
                 if not row or row[0].strip().lower() != uuid.lower():
@@ -145,11 +169,16 @@ while True:
                 pid = int(row[1])
                 try:
                     if os.getpgid(pid) != group:
-                        foreign.append(pid)
+                        foreign.append({"pid": pid, "memory_used_mib": int(row[2])})
                 except ProcessLookupError:
                     pass
-            if foreign:
-                reason = {"foreign_compute_pids": foreign}
+            if shared:
+                used = int(subprocess.check_output(["nvidia-smi", f"--id={uuid}", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], text=True, timeout=5).strip())
+                foreign_memory = sum(process["memory_used_mib"] for process in foreign)
+                if foreign_memory > 8 * 1024 or used > 20 * 1024:
+                    reason = {"foreign_compute_processes": foreign, "foreign_compute_memory_mib": foreign_memory, "gpu_memory_used_mib": used}
+            elif foreign:
+                reason = {"foreign_compute_pids": [process["pid"] for process in foreign]}
         except Exception as error:
             reason = {"gpu_watch_failed": str(error)}
     if reason is not None:
