@@ -620,8 +620,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
         return loss
 
+    def _global_valid_sample_count(self, batch: dict[str, torch.Tensor]) -> int:
+        """Count valid mask entries across the actor gradient-reduction group."""
+        mask = batch.get("loss_mask")
+        count = (
+            torch.tensor(batch["prev_logprobs"].numel(), dtype=torch.int64)
+            if mask is None
+            else mask.count_nonzero()
+        ).to(device=self.device)
+        torch.distributed.all_reduce(
+            count, op=torch.distributed.ReduceOp.SUM, group=self._dp_group
+        )
+        return int(count.item())
+
     @Worker.timer("run_training")
-    def run_training(self) -> None:
+    def run_training(self) -> dict[str, float]:
         """
         Run the training process using the received rollout batch.
         """
@@ -665,6 +678,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
+        skipped_batches = 0
+        valid_samples = 0
+        optimizer_updates = 0
         if self.cfg.algorithm.get("recompute_logprobs", False):
             append_to_dict(metrics, self.recompute_prev_logprobs(batch_size_per_rank))
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
@@ -685,6 +701,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
 
+                global_valid_samples = self._global_valid_sample_count(
+                    train_global_batch
+                )
+                valid_samples += global_valid_samples
+                # Co-training has a separate supervised loss when the RL mask is empty.
+                if global_valid_samples == 0 and not self.enable_sft_co_train:
+                    skipped_batches += 1
+                    continue
+
                 train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
@@ -704,6 +729,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.torch_platform.empty_cache()
 
                 grad_norm, lr_list = self.optimizer_step()
+                optimizer_updates += 1
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -712,11 +738,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
         # put LR scheduler step here
-        self.lr_scheduler.step()
+        if optimizer_updates or not skipped_batches:
+            self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        if skipped_batches:
+            mean_metric_dict.update(
+                {
+                    "actor/skipped_no_valid_samples": float(skipped_batches),
+                    "actor/valid_samples": float(valid_samples),
+                }
+            )
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )

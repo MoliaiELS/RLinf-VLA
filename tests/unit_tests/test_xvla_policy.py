@@ -14,7 +14,10 @@
 
 """Exercise X-VLA through the policy and actual RLinf algorithm contracts."""
 
+import copy
+import inspect
 import socket
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -472,3 +475,205 @@ def test_frozen_fsdp_weights_avoid_flat_grad_and_roundtrip_full_state(
             torch.testing.assert_close(restored[name], expected[name], rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
+
+
+class _DensityPolicy(torch.nn.Module):
+    """Small differentiable policy using the embodied actor forward contract."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([0.25]))
+
+    def forward(self, forward_inputs, **kwargs):
+        return {"logprobs": self.weight * forward_inputs["features"]}
+
+
+def _actor_valid_count_process(rank, init_method, output):
+    import torch.distributed as dist
+
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        worker = object.__new__(EmbodiedFSDPActor)
+        worker.device = torch.device("cpu")
+        worker._dp_group = dist.new_group([0, 1], backend="gloo")
+        counts = []
+        for case in range(3):
+            batch = {"prev_logprobs": torch.zeros(3)}
+            if case < 2 or rank == 1:
+                batch["loss_mask"] = torch.tensor([case == 1 and rank == 1])
+            counts.append(worker._global_valid_sample_count(batch))
+        output.put((rank, counts))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_embodied_actor_empty_batch_preserves_adam_momentum_and_scheduler(monkeypatch):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+    from rlinf.scheduler import Worker
+    from rlinf.utils.utils import get_loss_agg_func
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    if dist.is_initialized():
+        pytest.skip("CPU actor contract owns its process group")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("USE_LIBUV", "0")
+    cpu_platform = SimpleNamespace(
+        current_device=lambda: torch.device("cpu"),
+        empty_cache=lambda: None,
+        synchronize=lambda: None,
+        ipc_collect=lambda: None,
+    )
+    monkeypatch.setattr(Worker, "torch_device_type", "cpu")
+    monkeypatch.setattr(Worker, "torch_platform", cpu_platform)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}?use_libuv=0",
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        worker = object.__new__(EmbodiedFSDPActor)
+        worker.cfg = OmegaConf.create(
+            {
+                "runner": {"task_type": "embodied"},
+                "actor": {
+                    "seed": 1234,
+                    "global_batch_size": 2,
+                    "micro_batch_size": 1,
+                    "model": {"model_type": "mlp_policy", "action_dim": 1},
+                    "optim": {"clip_grad": 1.0},
+                    "fsdp_config": {"enable_gradient_accumulation": True},
+                },
+                "algorithm": {
+                    "loss_type": "actor",
+                    "adv_type": "grpo",
+                    "reward_type": "chunk_level",
+                    "logprob_type": "chunk_level",
+                    "entropy_bonus": 0.0,
+                    "clip_ratio_high": 0.2,
+                    "clip_ratio_low": 0.2,
+                },
+                "env": {"train": {"max_episode_steps": 1}},
+            }
+        )
+        worker._cfg = worker.cfg.actor
+        worker._world_size = 1
+        worker._rank = 0
+        worker._dp_group = dist.group.WORLD
+        worker.device = torch.device("cpu")
+        worker.torch_platform = cpu_platform
+        worker.is_weight_offloaded = False
+        worker.is_optimizer_offloaded = False
+        worker.enable_sft_co_train = False
+        worker.gradient_accumulation = 2
+        worker.critic_warmup_steps = 0
+        worker.optimizer_steps = 0
+        worker.version = 7
+        worker.amp_context = nullcontext()
+        worker.loss_agg_func = get_loss_agg_func("token-mean")
+        worker._strategy = FSDPStrategy(worker.cfg.actor, 1, worker._dp_group)
+        worker.model = FullyShardedDataParallel(
+            _DensityPolicy(),
+            use_orig_params=True,
+            sharding_strategy=ShardingStrategy.NO_SHARD,
+            device_id=torch.device("cpu"),
+        )
+        worker.optimizer = torch.optim.AdamW(
+            worker.model.parameters(), lr=1e-3, betas=(0.9, 0.95), weight_decay=0.0
+        )
+        worker.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            worker.optimizer, 1, gamma=0.5
+        )
+        worker.grad_scaler = torch.amp.GradScaler("cpu", enabled=False)
+
+        def training_batch(valid):
+            features = torch.tensor([1.0, 2.0]).reshape(1, 2, 1, 1)
+            return {
+                "prev_logprobs": worker.model.module.weight.detach() * features,
+                "forward_inputs": {"features": features},
+                "advantages": torch.tensor([1.0, -1.0]).reshape(1, 2, 1),
+                "loss_mask": torch.full((1, 2, 1), valid, dtype=torch.bool),
+            }
+
+        worker.rollout_batch = training_batch(True)
+        initial_weight = worker.model.module.weight.detach().clone()
+        inspect.unwrap(EmbodiedFSDPActor.run_training)(worker)
+        assert worker.optimizer_steps == 1
+        assert not torch.equal(worker.model.module.weight, initial_weight)
+        assert any(
+            state["exp_avg"].count_nonzero()
+            for state in worker.optimizer.state.values()
+        )
+        parameters = {
+            name: value.detach().clone()
+            for name, value in worker.model.named_parameters()
+        }
+        optimizer_state = copy.deepcopy(worker.optimizer.state_dict())
+        scheduler_state = copy.deepcopy(worker.lr_scheduler.state_dict())
+        worker.rollout_batch = training_batch(False)
+        metrics = inspect.unwrap(EmbodiedFSDPActor.run_training)(worker)
+        assert metrics["actor/skipped_no_valid_samples"] == 1
+        assert metrics["actor/valid_samples"] == 0
+        assert worker.optimizer_steps == 1
+        assert worker.version == 7
+        torch.testing.assert_close(
+            worker.optimizer.state_dict(), optimizer_state, rtol=0, atol=0
+        )
+        assert worker.lr_scheduler.state_dict() == scheduler_state
+        for name, parameter in worker.model.named_parameters():
+            torch.testing.assert_close(parameter, parameters[name], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_embodied_actor_valid_sample_count_reduces_across_cpu_ranks(monkeypatch):
+    import multiprocessing as mp
+
+    monkeypatch.setenv("USE_LIBUV", "0")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    context = mp.get_context("spawn")
+    output = context.Queue()
+    processes = [
+        context.Process(
+            target=_actor_valid_count_process,
+            args=(rank, f"tcp://127.0.0.1:{port}?use_libuv=0", output),
+        )
+        for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(40)
+            assert not process.is_alive(), (
+                "Actor sample-count collective did not complete"
+            )
+            assert process.exitcode == 0
+        assert sorted(output.get(timeout=5) for _ in processes) == [
+            (0, [0, 1, 3]),
+            (1, [0, 1, 3]),
+        ]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(5)
+        output.close()
