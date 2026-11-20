@@ -134,6 +134,47 @@ class FSDPStrategy(FSDPStrategyBase):
             return
         self._rebind_sharded_tensor_views(handle)
 
+    def _get_ignored_parameters(
+        self, model: nn.Module, mixed_precision, auto_wrap_policy
+    ) -> list[nn.Parameter] | None:
+        if self.cfg.model.model_type != "xvla":
+            return None
+        ignored_parameters = model.get_fsdp_ignored_parameters()
+        if not ignored_parameters:
+            return None
+        if (
+            self.world_size != 1
+            or self.cfg.fsdp_config.sharding_strategy != "no_shard"
+            or auto_wrap_policy is not None
+            or not self.cfg.fsdp_config.use_orig_params
+            or self.cfg.fsdp_config.cpu_offload
+            or self.cfg.get("enable_offload", False)
+            or any(
+                getattr(mixed_precision, name) not in (None, torch.float32)
+                for name in ("param_dtype", "reduce_dtype", "buffer_dtype")
+            )
+            or any(parameter.dtype != torch.float32 for parameter in model.parameters())
+        ):
+            raise ValueError(
+                "X-VLA frozen FSDP parameters require one FP32 NO_SHARD root "
+                "with use_orig_params=true and offload disabled"
+            )
+        parameter_ids = {id(parameter) for parameter in model.parameters()}
+        if any(
+            not isinstance(parameter, nn.Parameter)
+            or parameter.requires_grad
+            or id(parameter) not in parameter_ids
+            for parameter in ignored_parameters
+        ):
+            raise ValueError(
+                "X-VLA FSDP can ignore only its registered frozen parameters"
+            )
+        # FSDP's device_id migration skips ignored parameters.
+        model.to(
+            device=torch.device(Worker.torch_device_type, int(os.environ["LOCAL_RANK"]))
+        )
+        return model.get_fsdp_ignored_parameters()
+
     def wrap_model(self, model: nn.Module, device_mesh: DeviceMesh) -> FSDP:
         """
         Wrap the model with FSDP using the specified configuration,
@@ -178,6 +219,9 @@ class FSDPStrategy(FSDPStrategyBase):
         )
 
         cpu_offload = CPUOffload(offload_params=self.cfg.fsdp_config.cpu_offload)
+        ignored_parameters = self._get_ignored_parameters(
+            model, mixed_precision, auto_wrap_policy
+        )
 
         fsdp_model = FSDP(
             module=model,
@@ -193,6 +237,7 @@ class FSDPStrategy(FSDPStrategyBase):
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
             cpu_offload=cpu_offload,
+            ignored_states=ignored_parameters,
         )
         apply_buffer_dtype_compatibility(fsdp_model)
         return fsdp_model

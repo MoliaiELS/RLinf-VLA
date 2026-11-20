@@ -127,6 +127,16 @@ class XVLAPolicy(nn.Module, BasePolicy):
         self._no_split_modules = ["SoftPromptedTransformer"]
         self.global_step = 0
 
+    def get_fsdp_ignored_parameters(self) -> list[nn.Parameter]:
+        """Keep frozen weights outside the single-rank FSDP gradient buffer.
+
+        Returns:
+            Frozen parameters that remain registered in the model state.
+        """
+        return [
+            parameter for parameter in self.parameters() if not parameter.requires_grad
+        ]
+
     def _set_trainable_scope(self, scope: str) -> None:
         if scope not in {"prompt_heads", "action_head", "full"}:
             raise ValueError(f"Expected prompt_heads, action_head or full; got {scope}")

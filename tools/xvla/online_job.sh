@@ -21,7 +21,9 @@ test "$(git -C "$repo" rev-parse HEAD)" = "$commit"
 test -r "$prefix/bin/activate"
 test -x "$prefix/bin/python"
 source "$prefix/bin/activate"
-export USER="$(id -un)"
+# Compute nodes may lack the submitter's passwd entry.
+export USER="${SLURM_JOB_USER:-${LOGNAME:-${USER:?Slurm submitter name is required}}}"
+export LOGNAME="$USER"
 export XVLA_RUN_DIR="$output_root/$SLURM_JOB_ID/$algorithm"
 export ROBOTWIN_PATH="$robotwin_root" XVLA_MODEL_PATH="$model_path"
 export XVLA_ONLINE_ACCEPTANCE=1 USE_TF=0 USE_TORCH=1

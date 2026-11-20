@@ -14,6 +14,8 @@
 
 """Exercise X-VLA through the policy and actual RLinf algorithm contracts."""
 
+import socket
+from datetime import timedelta
 from types import SimpleNamespace
 
 import numpy as np
@@ -331,3 +333,142 @@ def test_prompt_heads_with_real_vendor_transformer_and_activation_checkpoint():
         for parameter in selected.values()
     )
     assert all(parameter.grad is None for parameter in core.encoder.parameters())
+
+
+def fsdp_actor_config():
+    return OmegaConf.create(
+        {
+            "model": {"model_type": "xvla", "is_lora": False},
+            "enable_offload": False,
+            "fsdp_config": {
+                "sharding_strategy": "no_shard",
+                "disable": True,
+                "use_orig_params": True,
+                "cpu_offload": False,
+                "forward_prefetch": False,
+                "backward_prefetch": None,
+                "limit_all_gathers": False,
+                "mixed_precision": {
+                    "param_dtype": "fp32",
+                    "reduce_dtype": "fp32",
+                    "buffer_dtype": "fp32",
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["multiple_ranks", "sharding", "child_wrap", "orig_params", "offload", "precision"],
+)
+def test_frozen_fsdp_parameters_require_the_single_rank_fp32_contract(invalid):
+    from torch.distributed.fsdp import MixedPrecision
+
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+
+    model = make_policy()
+    model.core.encoder.requires_grad_(False)
+    cfg = fsdp_actor_config()
+    world_size = 2 if invalid == "multiple_ranks" else 1
+    wrap_policy = object() if invalid == "child_wrap" else None
+    if invalid == "sharding":
+        cfg.fsdp_config.sharding_strategy = "full_shard"
+    elif invalid == "orig_params":
+        cfg.fsdp_config.use_orig_params = False
+    elif invalid == "offload":
+        cfg.enable_offload = True
+    precision = torch.bfloat16 if invalid == "precision" else torch.float32
+    strategy = FSDPStrategy(cfg, world_size)
+    with pytest.raises(ValueError, match="one FP32 NO_SHARD root"):
+        strategy._get_ignored_parameters(
+            model, MixedPrecision(param_dtype=precision), wrap_policy
+        )
+
+
+def test_other_models_do_not_opt_into_ignored_frozen_parameters():
+    from torch.distributed.fsdp import MixedPrecision
+
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+
+    cfg = fsdp_actor_config()
+    cfg.model.model_type = "openpi"
+    model = nn.Linear(2, 2).requires_grad_(False)
+    assert (
+        FSDPStrategy(cfg, 2)._get_ignored_parameters(model, MixedPrecision(), None)
+        is None
+    )
+
+
+def test_frozen_fsdp_weights_avoid_flat_grad_and_roundtrip_full_state(
+    monkeypatch, tmp_path
+):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel
+
+    from rlinf.hybrid_engines.fsdp.strategy import fsdp as strategy_module
+    from rlinf.scheduler import Worker
+
+    if dist.is_initialized():
+        pytest.skip("CPU FSDP contract owns its single-rank process group")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("USE_LIBUV", "0")
+    monkeypatch.setattr(Worker, "torch_device_type", "cpu")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}?use_libuv=0",
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        model = make_policy()
+        model.core.encoder.requires_grad_(False)
+        model.register_buffer("frozen_buffer", torch.tensor([17.0]))
+        frozen = model.get_fsdp_ignored_parameters()
+        expected_ids = {id(parameter) for parameter in frozen}
+        trainable_numel = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        expected = {name: value.clone() for name, value in model.state_dict().items()}
+        _, rollout = model.predict_action_batch(observation(), mode="train")
+        captured = {}
+
+        def cpu_fsdp(**kwargs):
+            captured.update(kwargs)
+            # Keep the real FSDP implementation; adapt only the accelerator boundary.
+            kwargs["device_id"] = torch.device("cpu")
+            kwargs["sync_module_states"] = False
+            return FullyShardedDataParallel(**kwargs)
+
+        monkeypatch.setattr(strategy_module, "FSDP", cpu_fsdp)
+        strategy = strategy_module.FSDPStrategy(fsdp_actor_config(), 1)
+        wrapped = strategy.wrap_model(model, None)
+        assert {
+            id(parameter) for parameter in captured["ignored_states"]
+        } == expected_ids
+        assert sum(wrapped._handle.flat_param._numels) == trainable_numel
+        result = wrapped(forward_inputs=rollout["forward_inputs"], compute_values=True)
+        (-result["logprobs"].sum() + result["values"].square().sum()).backward()
+        assert wrapped._handle.flat_param.grad is not None
+        assert all(parameter.grad is None for parameter in frozen)
+        assert model.core.transformer.theta.grad.norm() > 0
+        full_state = strategy.get_model_state_dict(wrapped, True, True)
+        assert full_state.keys() == expected.keys()
+        for name in expected:
+            torch.testing.assert_close(full_state[name], expected[name], rtol=0, atol=0)
+        checkpoint = tmp_path / "full_weights.pt"
+        torch.save(full_state, checkpoint)
+        with torch.no_grad():
+            model.core.encoder.weight.add_(1)
+            model.core.transformer.theta.add_(1)
+            model.frozen_buffer.add_(1)
+        strategy.load_model_with_state_dict(
+            wrapped, torch.load(checkpoint, weights_only=True), True, True
+        )
+        restored = strategy.get_model_state_dict(wrapped, True, True)
+        for name in expected:
+            torch.testing.assert_close(restored[name], expected[name], rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
