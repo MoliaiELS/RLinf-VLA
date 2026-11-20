@@ -31,6 +31,7 @@ export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export RAY_TMPDIR="/tmp/xvla_rl_${USER}_${SLURM_JOB_ID}"
 export FYP_XVLA_RAY_SPILL="$XVLA_RUN_DIR/ray-spill"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+export USE_TF=0 USE_TORCH=1
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONUNBUFFERED=1
 python - "$repo" <<'PY'
 import importlib.util
@@ -76,4 +77,7 @@ receipt.update(gpu_uuid=uuid, gpu_model=properties.name, vulkan_device=vulkan)
 PY
 export FYP_ROBOTWIN_VULKAN_DEVICE="$(cat "$XVLA_RUN_DIR/vulkan-device.txt")"
 cd "$repo"
+if [[ "${XVLA_ONLINE_ACCEPTANCE:-0}" == 1 ]]; then
+    exec python -m tools.xvla.online_acceptance --config-name "$config" "$@"
+fi
 exec python examples/embodiment/train_embodied_agent.py --config-name "$config" "$@"
