@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import socket
 import subprocess
 import sys
 import time
@@ -198,8 +200,14 @@ def _run(cfg) -> None:
 
     from tools.xvla.robotwin.runner import same_scene
 
-    if not os.environ.get("SLURM_JOB_ID"):
-        raise RuntimeError("Sampler diagnosis requires an allocated Slurm job")
+    login_debug = (
+        os.environ.get("XVLA_LOGIN_DIAGNOSTIC") == "1"
+        and socket.gethostname() == "4090node1"
+    )
+    if not os.environ.get("SLURM_JOB_ID") and not login_debug:
+        raise RuntimeError(
+            "Use a Slurm allocation or the bounded login diagnostic launcher"
+        )
     if (
         cfg.actor.model.model_type != "xvla"
         or cfg.actor.model.xvla.noise_method != "flow_noise"
@@ -213,6 +221,8 @@ def _run(cfg) -> None:
     plan = trial_plan()
     result = {
         "status": "RUNNING",
+        "hostname": socket.gethostname(),
+        "login_diagnostic": login_debug,
         "plan": plan,
         "trials": [],
         "scope": "Frozen-model paired diagnosis; no optimizer or RL update",
@@ -227,6 +237,15 @@ def _run(cfg) -> None:
     if target.exists():
         raise FileExistsError("Choose a new sampler diagnostic result directory")
     _write(target, result)
+
+    def interrupted(signum, frame):
+        del frame
+        result.update(status="INTERRUPTED", signal=signum)
+        _write(target, result)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     for trial in plan:
         folder = root / f"{trial['seed']}-{trial['mode']}"
         command = [
@@ -275,6 +294,12 @@ def _run(cfg) -> None:
                 ).read_text()
             )
             if not same_scene(previous["scene"], initial["scene"]):
+                result.update(
+                    status="FAILED",
+                    failed_trial=trial,
+                    error="Paired initial scenes differ",
+                )
+                _write(target, result)
                 raise RuntimeError("Paired diagnostic initial scenes differ")
         result["trials"].append(summary)
         _write(target, result)
