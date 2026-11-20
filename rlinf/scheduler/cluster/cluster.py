@@ -48,6 +48,64 @@ if TYPE_CHECKING:
     from ..worker import Worker
 
 
+def _xvla_isolated_ray_kwargs() -> dict[str, Any] | None:
+    """Build an opt-in Ray configuration bounded by this Slurm allocation.
+
+    Returns:
+        The local Ray arguments, or None when isolation is disabled.
+
+    Raises:
+        RuntimeError: If the allocation or job-private directories are missing.
+        ValueError: If requested resources exceed the allocation or path bounds.
+    """
+    if os.environ.get("RLINF_XVLA_ISOLATED_RAY") != "1":
+        return None
+    import json
+
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        raise RuntimeError("Isolated X-VLA Ray requires a Slurm allocation")
+    allocated_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    requested_cpus = int(os.environ.get("RLINF_XVLA_RAY_CPUS", str(allocated_cpus)))
+    if not 1 <= requested_cpus <= allocated_cpus:
+        raise ValueError("Ray CPUs must be positive and bounded by SLURM_CPUS_PER_TASK")
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    gpu_ids = [item.strip() for item in visible.split(",") if item.strip()]
+    if any(item in {"-1", "NoDevFiles"} for item in gpu_ids):
+        gpu_ids = []
+    store_bytes = int(
+        os.environ.get("RLINF_XVLA_RAY_OBJECT_STORE_BYTES", str(2 * 1024**3))
+    )
+    if not 80 * 1024**2 <= store_bytes <= 2 * 1024**3:
+        raise ValueError(
+            "X-VLA Ray object store must be bounded between 80 MiB and 2 GiB"
+        )
+    temp_value = os.environ.get("RAY_TMPDIR")
+    spill_value = os.environ.get("FYP_XVLA_RAY_SPILL")
+    if not temp_value or not spill_value:
+        raise RuntimeError("Set job-private RAY_TMPDIR and FYP_XVLA_RAY_SPILL")
+    temp_dir, spill_dir = Path(temp_value), Path(spill_value)
+    for label, directory in (("Ray temp", temp_dir), ("Ray spill", spill_dir)):
+        if not directory.is_absolute() or job_id not in str(directory):
+            raise ValueError(
+                f"{label} path must be absolute and contain the Slurm job ID"
+            )
+        directory.mkdir(parents=True, exist_ok=True)
+    return {
+        "address": "local",
+        "num_cpus": requested_cpus,
+        "num_gpus": len(gpu_ids),
+        "object_store_memory": store_bytes,
+        "include_dashboard": False,
+        "_temp_dir": str(temp_dir),
+        "_system_config": {
+            "object_spilling_config": json.dumps(
+                {"type": "filesystem", "params": {"directory_path": str(spill_dir)}}
+            )
+        },
+    }
+
+
 class ClusterEnvVar(str, Enum):
     """Scheduler environment variables. All env vars are prefixed with {Cluster.SYS_NAME}_ in usage."""
 
@@ -330,32 +388,45 @@ class Cluster:
             Cluster._prepare_ray_code_sync_runtime_env_fragment()
         )
 
-        try:
-            # First try to connect to an existing Ray cluster
-            ray_init_kwargs: dict[str, Any] = {
-                "address": "auto",
-                "logging_level": Cluster.LOGGING_LEVEL,
-                "namespace": Cluster.NAMESPACE,
-            }
-            if self._ray_code_sync_fragment is not None:
-                ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
-                py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
-                self._logger.info(
-                    "%s Ray code sync is enabled (py_modules=%r); workers receive "
-                    "only the rlinf package from the launch node. Disable with %s=0.",
-                    Cluster.SYS_NAME,
-                    tuple(py_mods),
-                    Cluster.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR),
-                )
-            ray.init(**ray_init_kwargs)
-        except ConnectionError:
+        isolated_kwargs = _xvla_isolated_ray_kwargs()
+        if isolated_kwargs is not None:
+            if self._num_nodes not in (0, 1):
+                raise ValueError("Isolated X-VLA Ray supports one allocated node only")
             ray_init_kwargs = {
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
+                **isolated_kwargs,
             }
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
             self._start_local_ray(ray_init_kwargs)
+        else:
+            try:
+                # First try to connect to an existing Ray cluster
+                ray_init_kwargs: dict[str, Any] = {
+                    "address": "auto",
+                    "logging_level": Cluster.LOGGING_LEVEL,
+                    "namespace": Cluster.NAMESPACE,
+                }
+                if self._ray_code_sync_fragment is not None:
+                    ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+                    py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
+                    self._logger.info(
+                        "%s Ray code sync is enabled (py_modules=%r); workers receive "
+                        "only the rlinf package from the launch node. Disable with %s=0.",
+                        Cluster.SYS_NAME,
+                        tuple(py_mods),
+                        Cluster.get_full_env_var_name(ClusterEnvVar.CODE_WORKING_DIR),
+                    )
+                ray.init(**ray_init_kwargs)
+            except ConnectionError:
+                ray_init_kwargs = {
+                    "logging_level": Cluster.LOGGING_LEVEL,
+                    "namespace": Cluster.NAMESPACE,
+                }
+                if self._ray_code_sync_fragment is not None:
+                    ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
+                self._start_local_ray(ray_init_kwargs)
 
         # Ray log collector
         if distributed_log_dir is not None:
@@ -461,6 +532,17 @@ class Cluster:
             if self._distributed_log_collector is not None:
                 self._distributed_log_collector.stop()
 
+            if os.environ.get("RLINF_XVLA_ISOLATED_RAY") == "1":
+                # Dashboard/state APIs are intentionally disabled for this
+                # bounded job-local Ray. Preserve the worker error above rather
+                # than replacing it with a secondary list_actors API failure.
+                # Ray interpreter cleanup and Slurm own this private instance.
+                self._logger.error(
+                    "Exiting isolated X-VLA driver after worker failure; "
+                    "preserve the original worker exception above."
+                )
+                raise SystemExit(1)
+
             with without_http_proxies():
                 alive_actors = list_actors(
                     filters=[
@@ -498,6 +580,11 @@ class Cluster:
 
     def _init_from_existing_managers(self):
         if not ray.is_initialized():
+            if os.environ.get("RLINF_XVLA_ISOLATED_RAY") == "1":
+                raise RuntimeError(
+                    "X-VLA worker must already belong to its allocated job's Ray context; "
+                    "refusing address=auto"
+                )
             ray.init(
                 address="auto",
                 namespace=Cluster.NAMESPACE,

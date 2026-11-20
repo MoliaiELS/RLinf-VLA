@@ -97,6 +97,8 @@ jobs:
               - 'rlinf/workers/env/**'
               - 'rlinf/workers/rollout/hf/**'
               - 'rlinf/models/embodiment/**'
+              - 'xvla_rlinf/**'
+              - 'tools/xvla/**'
               - 'rlinf/models/diffusion/**'
               - 'rlinf/models/worldmodel/**'
               - 'rlinf/runners/*embodied*.py'
@@ -177,6 +179,10 @@ jobs:
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
               - *shared
+              - 'rlinf/models/embodiment/xvla/**'
+              - 'xvla_rlinf/**'
+              - 'examples/embodiment/config/*xvla.yaml'
+              - 'examples/embodiment/config/model/xvla.yaml'
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the
               # real-world compatibility suite, maniskill offload, delay

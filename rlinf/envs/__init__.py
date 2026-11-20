@@ -110,6 +110,10 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return LiberoEnv
     elif env_type == SupportedEnvType.ROBOTWIN:
+        if env_cfg is not None and env_cfg.get("xvla_native", False):
+            from rlinf.envs.sim.robotwin.xvla_env import XVLARoboTwinEnv
+
+            return XVLARoboTwinEnv
         from rlinf.envs.sim.robotwin.robotwin_env import RoboTwinEnv
 
         return RoboTwinEnv

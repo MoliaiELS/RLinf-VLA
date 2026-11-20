@@ -385,6 +385,26 @@ def prepare_actions(
             action_scale=action_scale,
             policy=policy,
         )
+    elif (
+        env_type == SupportedEnvType.ROBOTWIN
+        and env_cfg is not None
+        and env_cfg.get("xvla_native", False)
+    ):
+        if action_dim != 20 or num_action_chunks != 30 or action_scale != 1.0:
+            raise ValueError("Native X-VLA requires unscaled dual-arm 30-by-20 actions")
+        chunk_actions = np.asarray(raw_chunk_actions)
+        if (
+            chunk_actions.ndim != 3
+            or chunk_actions.shape[1:] != (30, 20)
+            or not np.isfinite(chunk_actions).all()
+        ):
+            raise ValueError("Native X-VLA actions must be finite [B,30,20] arrays")
+        grips = chunk_actions[..., [9, 19]]
+        if np.any((grips < 0) | (grips > 1)):
+            raise ValueError(
+                "Native X-VLA gripper actions must be postprocessed probabilities"
+            )
+        chunk_actions = np.ascontiguousarray(chunk_actions)
     elif env_type in (
         SupportedEnvType.ROBOTWIN,
         SupportedEnvType.ROBODOJO,

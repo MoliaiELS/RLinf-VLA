@@ -94,6 +94,7 @@ SupportedModel.OPENVLA = SupportedModel.register("openvla", force=True)
 SupportedModel.OPENVLA_OFT = SupportedModel.register("openvla_oft", force=True)
 SupportedModel.MOLMOACT2 = SupportedModel.register("molmoact2", force=True)
 SupportedModel.OPENPI = SupportedModel.register("openpi", force=True)
+SupportedModel.XVLA = SupportedModel.register("xvla", force=True)
 SupportedModel.PSI0 = SupportedModel.register("psi0", force=True)
 SupportedModel.PI0_FAST = SupportedModel.register("pi0_fast", force=True)
 SupportedModel.STARVLA = SupportedModel.register("starvla", force=True)
@@ -143,6 +144,7 @@ EMBODIED_MODEL = set(
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
         SupportedModel.OPENPI,
+        SupportedModel.XVLA,
         SupportedModel.PSI0,
         SupportedModel.PI0_FAST,
         SupportedModel.STARVLA,
@@ -1182,7 +1184,54 @@ def validate_online_lerobot_env_cfg(cfg: DictConfig) -> None:
     )
 
 
+def validate_xvla_cfg(cfg):
+    """Check the native dual-arm flow-policy and chunk-level RL contracts."""
+    if (
+        cfg.runner.get("only_eval", False)
+        or cfg.runner.get("task_type") == "embodied_eval"
+    ):
+        return
+    model = cfg.actor.model
+    if str(model.model_type) != "xvla":
+        return
+    pair = (cfg.algorithm.adv_type, cfg.algorithm.loss_type)
+    if pair not in {("gae", "actor_critic"), ("grpo", "actor")}:
+        raise ValueError("X-VLA supports PPO (gae/actor_critic) or GRPO (grpo/actor)")
+    if bool(model.get("add_value_head", False)) != (pair[0] == "gae"):
+        raise ValueError("X-VLA PPO requires a value head; GRPO requires it disabled")
+    for key in ("reward_type", "logprob_type", "entropy_type"):
+        if cfg.algorithm.get(key) != "chunk_level":
+            raise ValueError(f"X-VLA requires algorithm.{key}=chunk_level")
+    if model.get("logprob_action_dim") != 1 or model.get("action_dim") != 20:
+        raise ValueError(
+            "X-VLA requires logprob_action_dim=1 and dual-arm action_dim=20"
+        )
+    if model.get("num_action_chunks") != 30 or model.get("precision") != "fp32":
+        raise ValueError("X-VLA requires num_action_chunks=30 and precision=fp32")
+    if model.xvla.get("noise_method") not in {"flow_noise", "flow_sde"}:
+        raise ValueError("X-VLA training requires stochastic flow_noise or flow_sde")
+    if pair[0] == "gae" and cfg.algorithm.get("filter_rewards", False):
+        raise ValueError("PPO must retain zero-reward rollout batches")
+    if cfg.algorithm.get("entropy_bonus", 0) != 0:
+        raise ValueError("X-VLA path entropy is diagnostic; entropy_bonus must be zero")
+    if cfg.rollout.get("pipeline_stage_num", 1) != 1:
+        raise ValueError("Native X-VLA currently supports one rollout pipeline stage")
+    for mode in ("train", "eval"):
+        env = cfg.env[mode]
+        if env.env_type != "robotwin" or not env.get("xvla_native", False):
+            raise ValueError(f"X-VLA env.{mode} requires the native RoboTwin adapter")
+        if env.get("auto_reset", False) or env.get("ignore_terminations", False):
+            raise ValueError("Native X-VLA requires strict episodes without autoreset")
+        if env.max_steps_per_rollout_epoch % 30:
+            raise ValueError("X-VLA rollout transport length must be a multiple of 30")
+    if cfg.env.train.group_size != cfg.algorithm.group_size:
+        raise ValueError("X-VLA environment and algorithm group_size must match")
+    if set(cfg.env.train.reset_seeds) & set(cfg.env.eval.reset_seeds):
+        raise ValueError("X-VLA training and evaluation reset seeds must be disjoint")
+
+
 def validate_embodied_cfg(cfg):
+    validate_xvla_cfg(cfg)
     only_eval = (
         cfg.runner.get("only_eval", False)
         or cfg.runner.get("task_type") == "embodied_eval"

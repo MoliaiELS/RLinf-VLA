@@ -17,6 +17,7 @@ outputs/*
 *.so
 .venv
 .venv-*
+.local/
 .docs-venv
 uv.lock
 rlinf/envs/sim/maniskill/assets

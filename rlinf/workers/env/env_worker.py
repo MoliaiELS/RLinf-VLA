@@ -494,9 +494,8 @@ class EnvWorker(Worker):
                 intervene_actions=intervene_actions,
                 intervene_flags=intervene_flags,
                 rlt_switch_flags=rlt_switch_flags,
-                executed_mask=infos["executed_mask"]
-                if SupportedEnvType(self.cfg.env.train.env_type)
-                is SupportedEnvType.SIMPLE
+                executed_mask=infos.get("executed_mask")
+                if isinstance(infos, dict)
                 else None,
             ),
         )

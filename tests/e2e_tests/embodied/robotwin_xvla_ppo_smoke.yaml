@@ -1,0 +1,11 @@
+defaults:
+  - robotwin_ppo_xvla
+  - _self_
+
+hydra:
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/embodiment/config
+
+runner:
+  logger:
+    experiment_name: robotwin_xvla_ppo_smoke

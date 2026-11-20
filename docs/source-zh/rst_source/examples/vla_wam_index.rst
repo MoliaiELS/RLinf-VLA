@@ -187,3 +187,4 @@
    Evo-1 <embodied/evo1>
    ABot-M0 <embodied/abot_m0>
    Psi0 <embodied/psi0>
+   X-VLA <embodied/xvla>

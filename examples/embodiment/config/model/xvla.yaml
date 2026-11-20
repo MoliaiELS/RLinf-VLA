@@ -1,0 +1,20 @@
+model_type: xvla
+model_path: ${oc.env:XVLA_MODEL_PATH}
+precision: fp32
+is_lora: false
+num_action_chunks: 30
+action_dim: 20
+logprob_action_dim: 1
+add_value_head: true
+pass_predict_mode: true
+xvla:
+  domain_id: 6
+  steps: 10
+  update_scope: prompt_heads
+  noise_method: flow_noise
+  eval_sampler: flow_ode
+  noise_std: [0.003, 0.003, 0.003, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.15, 0.003, 0.003, 0.003, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.15]
+  noise_min_ratio: 0.1
+  noise_max_ratio: 2.0
+  noise_hidden_dim: 128
+  sde_noise_level: 0.5

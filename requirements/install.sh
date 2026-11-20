@@ -122,7 +122,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_ENGINES=("sglang" "vllm" "phyai")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "psi0" "pi0_fast" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbotvlav2" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "sglang")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "xvla" "psi0" "pi0_fast" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "lingbotvlav2" "dreamzero" "fastwam" "cosmos3" "qwen3_vl" "abot_m0" "molmoact2" "evo1" "diffusion" "sglang")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "robocasa365" "franka" "franka-ros" "frankasim" "robotwin" "robodojo" "habitat" "opensora" "wan" "genesis" "geniesim" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "so101" "piper" "yam" "dummy" "polaris" "simple")
 
 #=======================Utility Functions=======================
@@ -1658,6 +1658,7 @@ apply_model_default_torch() {
     [ -z "$TORCH_VERSION" ] || return 0
     local model_torch="-"
     case "$MODEL" in
+        xvla) model_torch="2.6.0" ;;
         openpi)
             if [ "$ENV_NAME" = "yam" ]; then
                 # OpenPI 0.1.1 requires torch 2.7.1; sync its matching vision/codec stack.
@@ -2346,6 +2347,20 @@ if actual_transformers != expected_transformers:
 version("sglang-router")
 assert sglang_router is not None
 EOF
+}
+
+install_xvla_model() {
+    case "$ENV_NAME" in
+        robotwin|dummy) ;;
+        *) echo "X-VLA supports the native robotwin environment or dummy dependency setup" >&2; exit 1 ;;
+    esac
+    create_and_sync_venv
+    install_common_embodied_deps
+    uv pip install -r "$SCRIPT_DIR/embodied/models/xvla.txt"
+    if [ "$ENV_NAME" = "robotwin" ]; then
+        uv pip install -r "$SCRIPT_DIR/../tools/xvla/robotwin/requirements.txt"
+        echo 'Use the pinned native RoboTwin checkout, assets and CuRobo preparation from docs/robotwin/README.md.'
+    fi
 }
 
 install_common_embodied_deps() {
@@ -4604,6 +4619,9 @@ main() {
             fi
 
             case "$MODEL" in
+                xvla)
+                    install_xvla_model
+                    ;;
                 openvla)
                     install_openvla_model
                     ;;

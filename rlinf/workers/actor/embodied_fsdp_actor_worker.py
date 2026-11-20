@@ -797,7 +797,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_type": self.cfg.algorithm.loss_type,
             "logprob_type": self.cfg.algorithm.logprob_type,
             "reward_type": self.cfg.algorithm.reward_type,
-            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+            "single_action_dim": self.cfg.actor.model.get(
+                "logprob_action_dim", self.cfg.actor.model.get("action_dim", 7)
+            ),
             "logprobs": output_dict["logprobs"],
             "values": output_dict.get("values", None),
             "old_logprobs": prev_logprobs,
@@ -819,6 +821,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "log_logprob_diagnostics", False
             ),
         }
+        if (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.XVLA
+            and self.optimizer_steps == 0
+        ):
+            difference = (
+                (output_dict["logprobs"].detach() - prev_logprobs).flatten(1).sum(dim=1)
+            )
+            tolerance = float(
+                self.cfg.actor.model.xvla.get("initial_logprob_tolerance", 0.01)
+            )
+            if (
+                not torch.isfinite(difference).all()
+                or (difference.abs() > tolerance).any()
+            ):
+                raise RuntimeError(
+                    "X-VLA pre-update joint log-probability does not reproduce "
+                    f"the behavior policy within {tolerance}: {difference.tolist()}"
+                )
         if self.cfg.algorithm.get("importance_sampling_fix", False):
             loss_kwargs["rollout_logprobs"] = micro_batch["rollout_logprobs"]
             loss_kwargs["importance_sampling_clip"] = (
