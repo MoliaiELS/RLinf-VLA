@@ -32,6 +32,9 @@ export XVLA_LOGIN_DIAGNOSTIC=1 XVLA_RUN_DIR="$output"
 export XVLA_LOGIN_SHARE_FREE_CAPACITY="${XVLA_LOGIN_SHARE_FREE_CAPACITY:-0}"
 [[ "$XVLA_LOGIN_SHARE_FREE_CAPACITY" == 0 || "$XVLA_LOGIN_SHARE_FREE_CAPACITY" == 1 ]]
 export XVLA_LOGIN_MAX_TORCH_GIB=10
+export XVLA_LOGIN_SECONDS="${XVLA_LOGIN_SECONDS:-1200}"
+[[ "$XVLA_LOGIN_SECONDS" =~ ^[1-9][0-9]{1,3}$ && "$XVLA_LOGIN_SECONDS" -ge 30 && "$XVLA_LOGIN_SECONDS" -le 1200 ]] || { echo 'XVLA_LOGIN_SECONDS must be between 30 and 1200' >&2; exit 2; }
+term_seconds=$((XVLA_LOGIN_SECONDS - 15))
 export ROBOTWIN_PATH="$robotwin_root" XVLA_MODEL_PATH="$model_path"
 export CUDA_VISIBLE_DEVICES="$gpu_uuid" PYTHONPATH="$repo"
 export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
@@ -44,8 +47,8 @@ unset XVLA_ONLINE_ACCEPTANCE XVLA_SAMPLER_DIAGNOSTIC RLINF_XVLA_ISOLATED_RAY RAY
 mkdir -p "$output" "$WARP_CACHE_PATH"
 cd "$repo"
 # A new session confines timeout and the GPU watcher to our own process group.
-# TERM at 19m45s leaves 15s for KILL within the 20-minute diagnostic budget.
-exec setsid --wait timeout --signal=TERM --kill-after=15s 1185s nice -n 10 \
+# Reserve 15s for KILL within the selected diagnostic budget.
+exec setsid --wait timeout --signal=TERM --kill-after=15s "${term_seconds}s" nice -n 10 \
     "$prefix/bin/python" - "$repo" "$commit" "$gpu_uuid" > "$output/login-diagnostic.log" 2>&1 <<'PY'
 import csv
 import importlib.util
@@ -60,6 +63,7 @@ import time
 
 repo, commit, requested = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 root = pathlib.Path(os.environ["XVLA_RUN_DIR"])
+time_limit_seconds = int(os.environ["XVLA_LOGIN_SECONDS"])
 share_free_capacity = os.environ["XVLA_LOGIN_SHARE_FREE_CAPACITY"] == "1"
 if socket.gethostname() != "4090node1" or "SLURM_JOB_ID" in os.environ:
     raise RuntimeError("Login diagnostics require 4090node1 outside Slurm")
@@ -132,7 +136,7 @@ record = {
     "imports": {name: getattr(importlib.util.find_spec(name), "origin", None)
                 for name in ("rlinf", "transformers", "xvla_rlinf")},
     "login_diagnostic": True, "scope": "Frozen sampler diagnosis; no training or Ray",
-    "time_limit_seconds": 1200, "term_after_seconds": 1185, "kill_after_seconds": 15,
+    "time_limit_seconds": time_limit_seconds, "term_after_seconds": time_limit_seconds - 15, "kill_after_seconds": 15,
     "cuda_visible_devices": requested, "gpu_uuid": uuid, "gpu_model": properties.name,
     "vulkan_device": vulkan, "gpu_idle_checks": [first_check, last_check],
     "share_free_capacity": share_free_capacity, "max_torch_memory_gib": 10,

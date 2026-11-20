@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -61,6 +62,50 @@ def action_comparison(actions, reference) -> dict:
             ((actions[..., (9, 19)] > 0.7) != (reference[..., (9, 19)] > 0.7)).sum()
         ),
     }
+
+
+def resume_trials(previous: Path, destination: Path, cfg) -> list[dict]:
+    """Copy only completed trials with the same fixed plan and model settings."""
+    from omegaconf import OmegaConf
+
+    old = json.loads((previous / "sampler-diagnostic.json").read_text())
+    old_cfg = OmegaConf.load(previous / "diagnostic-config.yaml")
+    if old["plan"] != trial_plan():
+        raise ValueError("Cannot resume a different sampler diagnostic plan")
+    for before, after in (
+        (old_cfg.actor.model, cfg.actor.model),
+        (old_cfg.env.train, cfg.env.train),
+    ):
+        if OmegaConf.to_container(before, resolve=True) != OmegaConf.to_container(
+            after, resolve=True
+        ):
+            raise ValueError(
+                "Cannot resume changed model or native environment settings"
+            )
+    seen = set()
+    for trial in old["trials"]:
+        key = (trial["seed"], trial["mode"])
+        if (
+            key in seen
+            or key[0] not in SEEDS
+            or key[1] not in MODES
+            or trial["status"] != "COMPLETE"
+        ):
+            raise ValueError(
+                "Resume requires unique, completed trials from the fixed plan"
+            )
+        source = previous / f"{key[0]}-{key[1]}"
+        if json.loads((source / "summary.json").read_text()) != trial:
+            raise ValueError(
+                "Completed trial summary differs from its original manifest"
+            )
+        if json.loads((source / "initial-state.json").read_text())["reset_seeds"] != [
+            key[0]
+        ]:
+            raise ValueError("Completed trial initial-state seed differs from its plan")
+        shutil.copytree(source, destination / source.name)
+        seen.add(key)
+    return old["trials"]
 
 
 def _predictions(model, observation: dict, query: int) -> dict:
@@ -239,6 +284,10 @@ def _run(cfg) -> None:
             "Native recurrence/history controls use the same 300-step budget and task text as RL",
         ],
     }
+    previous = os.environ.get("XVLA_DIAGNOSTIC_RESUME_DIR")
+    if previous:
+        result["trials"] = resume_trials(Path(previous).resolve(), root, cfg)
+        result["resumed_from"] = previous
     target = root / "sampler-diagnostic.json"
     if target.exists():
         raise FileExistsError("Choose a new sampler diagnostic result directory")
@@ -253,6 +302,11 @@ def _run(cfg) -> None:
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     for trial in plan:
+        if any(
+            (entry["seed"], entry["mode"]) == (trial["seed"], trial["mode"])
+            for entry in result["trials"]
+        ):
+            continue
         folder = root / f"{trial['seed']}-{trial['mode']}"
         command = [
             sys.executable,
