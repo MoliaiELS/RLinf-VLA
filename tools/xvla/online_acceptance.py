@@ -548,6 +548,7 @@ def _worker_classes():
                 rank=self._rank,
                 global_step=self.audit_global_step,
                 stage=stage_id,
+                reset_state_ids=self.env_list[stage_id].reset_state_ids,
                 executed_actions=int(mask.sum()),
                 rewards=output.transition.rewards.detach().cpu().tolist(),
                 episode={
@@ -570,6 +571,7 @@ def _worker_classes():
                 rank=self._rank,
                 global_step=self.audit_global_step,
                 stage=stage_id,
+                reset_state_ids=self.eval_env_list[stage_id].reset_state_ids,
                 executed_actions=int((after - before).sum()),
                 episode={
                     key: value.detach().cpu().tolist()
