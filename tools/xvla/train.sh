@@ -77,6 +77,9 @@ receipt.update(gpu_uuid=uuid, gpu_model=properties.name, vulkan_device=vulkan)
 PY
 export FYP_ROBOTWIN_VULKAN_DEVICE="$(cat "$XVLA_RUN_DIR/vulkan-device.txt")"
 cd "$repo"
+if [[ "${XVLA_SAMPLER_DIAGNOSTIC:-0}" == 1 ]]; then
+    exec python -m tools.xvla.sampler_diagnostic --config-name "$config" "$@"
+fi
 if [[ "${XVLA_ONLINE_ACCEPTANCE:-0}" == 1 ]]; then
     exec python -m tools.xvla.online_acceptance --config-name "$config" "$@"
 fi

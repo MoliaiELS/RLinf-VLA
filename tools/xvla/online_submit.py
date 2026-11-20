@@ -46,6 +46,7 @@ class Submission:
     gpu: str = "4090"
     cpus: int = 8
     time_minutes: int = 20
+    sampler_diagnostic: bool = False
 
     def validate(self) -> None:
         """Reject paths or resources outside the short-test contract."""
@@ -145,6 +146,12 @@ def sbatch_command(plan: Submission) -> list[str]:
     plan.validate()
     duration = f"00:{plan.time_minutes:02d}:00"
     logs = PurePosixPath(plan.output_root) / "slurm"
+    job_name = (
+        "xvla-sampler-diagnostic"
+        if plan.sampler_diagnostic
+        else f"xvla-online-{plan.algorithm}"
+    )
+    exported = "ALL,XVLA_SAMPLER_DIAGNOSTIC=1" if plan.sampler_diagnostic else "ALL"
     return [
         "sbatch",
         "--parsable",
@@ -155,11 +162,11 @@ def sbatch_command(plan: Submission) -> list[str]:
         f"--cpus-per-task={plan.cpus}",
         f"--time={duration}",
         f"--gres=gpu:{plan.gpu}:1",
-        f"--job-name=xvla-online-{plan.algorithm}",
+        f"--job-name={job_name}",
         f"--output={logs}/%j.out",
         f"--error={logs}/%j.err",
         f"--chdir={plan.repo}",
-        "--export=ALL",
+        f"--export={exported}",
         str(PurePosixPath(plan.repo) / "tools/xvla/online_job.sh"),
         plan.repo,
         plan.env_prefix,
@@ -195,7 +202,13 @@ def validate_worktree(plan: Submission) -> None:
         raise ValueError("The online-test worktree has uncommitted files")
     for path in (
         repo / "tools/xvla/online_job.sh",
-        repo / "tools/xvla/online_acceptance.py",
+        repo
+        / "tools/xvla"
+        / (
+            "sampler_diagnostic.py"
+            if plan.sampler_diagnostic
+            else "online_acceptance.py"
+        ),
         repo / "tools/xvla/train.sh",
         Path(plan.env_prefix) / "bin/activate",
         Path(plan.env_prefix) / "bin/python",
@@ -373,6 +386,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu", choices=("4090", "3090"), default="4090")
     parser.add_argument("--cpus", type=int, choices=(8, 16), default=8)
     parser.add_argument("--time-minutes", type=int, default=20)
+    parser.add_argument("--sampler-diagnostic", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 

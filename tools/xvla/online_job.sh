@@ -45,6 +45,7 @@ record = {
     "job_id": os.environ["SLURM_JOB_ID"], "hostname": os.uname().nodename,
     "python": sys.executable, "prefix": sys.prefix,
     "cuda_visible_devices": os.environ["CUDA_VISIBLE_DEVICES"],
+    "sampler_diagnostic": os.environ.get("XVLA_SAMPLER_DIAGNOSTIC", "0") == "1",
     "slurm_cpus": os.environ["SLURM_CPUS_PER_TASK"],
     "physical_ram_bytes": os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"),
     "memory_isolation": "No Slurm memory request; physical memory is not reliably isolated",

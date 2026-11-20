@@ -53,6 +53,8 @@ def test_submission_uses_one_gpu_and_a_bounded_compute_node_job():
     assert "--gres=gpu:4090:1" in command
     assert "--cpus-per-task=8" in command
     assert "--time=00:20:00" in command
+    assert "--job-name=xvla-online-ppo" in command
+    assert "--export=ALL" in command
     assert not any(value.startswith("--mem") for value in command)
     assert command[-8:] == [
         config.repo,
@@ -70,6 +72,21 @@ def test_submission_uses_one_gpu_and_a_bounded_compute_node_job():
     assert "--gres=gpu:3090:1" in grpo
     assert "--time=00:30:00" in grpo
     assert grpo[-3] == "grpo"
+
+
+def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
+    config = plan()
+    regular = sbatch_command(config)
+    diagnostic = sbatch_command(replace(config, sampler_diagnostic=True))
+    assert "--job-name=xvla-sampler-diagnostic" in diagnostic
+    assert "--export=ALL,XVLA_SAMPLER_DIAGNOSTIC=1" in diagnostic
+    assert [
+        value
+        for value in diagnostic
+        if not value.startswith(("--job-name=", "--export="))
+    ] == [
+        value for value in regular if not value.startswith(("--job-name=", "--export="))
+    ]
 
 
 @pytest.mark.parametrize(
@@ -132,8 +149,11 @@ def test_scoped_cleanup_keeps_other_users_jobs_and_similar_directory_names():
     assert {entry.pid for entry in selected} == {10, 11, 12}
 
 
-def test_dry_run_prints_the_exact_plan_without_git_or_slurm(tmp_path):
-    config = plan()
+@pytest.mark.parametrize("sampler_diagnostic", [False, True])
+def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
+    tmp_path, sampler_diagnostic
+):
+    config = replace(plan(), sampler_diagnostic=sampler_diagnostic)
     script = Path(__file__).resolve().parents[2] / "tools/xvla/online_submit.py"
     args = []
     for field in (
@@ -146,6 +166,8 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(tmp_path):
         "algorithm",
     ):
         args.extend(("--" + field.replace("_", "-"), str(getattr(config, field))))
+    if sampler_diagnostic:
+        args.append("--sampler-diagnostic")
     completed = subprocess.run(
         [sys.executable, str(script), *args, "--dry-run"],
         check=True,
@@ -155,5 +177,6 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(tmp_path):
     )
     result = json.loads(completed.stdout)
     assert result["dry_run"] is True
+    assert result["plan"]["sampler_diagnostic"] is sampler_diagnostic
     assert result["command"] == sbatch_command(config)
     assert not list(tmp_path.iterdir())
