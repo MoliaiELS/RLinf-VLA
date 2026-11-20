@@ -547,6 +547,19 @@ def test_embodied_actor_empty_batch_preserves_adam_momentum_and_scheduler(monkey
         world_size=1,
         timeout=timedelta(seconds=30),
     )
+    native_all_reduce = dist.all_reduce
+
+    def cpu_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        # Torch 2.6 Gloo lacks AVG; SUM is exact for this single-rank CPU boundary.
+        if (
+            op == dist.ReduceOp.AVG
+            and dist.get_backend(group) == "gloo"
+            and dist.get_world_size(group) == 1
+        ):
+            op = dist.ReduceOp.SUM
+        return native_all_reduce(tensor, op=op, group=group, async_op=async_op)
+
+    monkeypatch.setattr(dist, "all_reduce", cpu_all_reduce)
     try:
         worker = object.__new__(EmbodiedFSDPActor)
         worker.cfg = OmegaConf.create(
