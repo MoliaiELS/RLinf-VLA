@@ -1,11 +1,11 @@
-# Tied groups remain skips; three effective updates are required for acceptance.
+# Allow six collection rounds; tied groups do not count toward three updates.
 defaults:
   - robotwin_grpo_xvla
   - _self_
 
 runner:
-  max_epochs: 3
-  max_steps: 3
+  max_epochs: 6
+  max_steps: 6
   val_check_interval: 3
   save_interval: 3
   logger:
