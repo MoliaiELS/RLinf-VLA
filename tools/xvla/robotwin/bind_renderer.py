@@ -51,10 +51,15 @@ def bind_renderer(*, pin_legacy_renderer: bool = False) -> None:
         pin_legacy_renderer
         and getattr(core.SapienRenderer.__init__, "_robotwin_device", None) != alias
     ):
+        worker_renderer = None
 
         def init_renderer(self, **kwargs) -> None:
+            nonlocal worker_renderer
             # The legacy wrapper discards device arguments before reaching pybind.
             sapien.pysapien.render.SapienRenderer.__init__(self, device)
+            # Keep the weakly cached engine alive across episode teardown.
+            if worker_renderer is None:
+                worker_renderer = self
 
         init_renderer._robotwin_device = alias
         core.SapienRenderer.__init__ = init_renderer

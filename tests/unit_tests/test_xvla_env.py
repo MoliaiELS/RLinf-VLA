@@ -495,7 +495,17 @@ def test_training_renderer_and_scene_share_the_explicit_vulkan_device(monkeypatc
     assert renderer.create_material() == "legacy material"
     assert renderer.device is scene[1].device
     assert renderer.device.alias == "pci:49:00.0"
+    first_renderer = weakref.ref(renderer)
+    del renderer, scene
+    assert first_renderer() is not None
+
     init = LegacyRenderer.__init__
     bind_renderer(pin_legacy_renderer=True)
     assert LegacyRenderer.__init__ is init
-    assert Engine().create_scene()[1].device is renderer.device
+    next_renderer = LegacyRenderer()
+    assert next_renderer is not first_renderer()
+    assert Engine().create_scene()[1].device is next_renderer.device
+    assert next_renderer.device is first_renderer().device
+    released_renderer = weakref.ref(next_renderer)
+    del next_renderer
+    assert released_renderer() is None
