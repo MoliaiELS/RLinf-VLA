@@ -206,6 +206,15 @@ For GRPO, run the corresponding configuration with a separate output directory:
    export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-grpo-acceptance
    XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_grpo_xvla_acceptance
 
+For compute-node submission, ``tools/xvla/online_submit.py`` defaults to a
+20-minute allocation and accepts ``--time-minutes`` from 1 to 90. Allow
+60 minutes for the multi-round GRPO check, including simulation, evaluation,
+and checkpoint verification. Repeated ``--override KEY=VALUE`` arguments
+pass Hydra settings literally to the training entry; use them to retain the
+original environment topology and set the checkpoint and collection limit
+when resuming. The login debug entry keeps its separate limit below 25 minutes
+per invocation; use Slurm for longer runs.
+
 These configurations set ``env.train.reset_seed_mode=cycle``. Group initial
 conditions traverse the original training pool, ``12000``–``12003``, in order
 and wrap around. Members of a GRPO group keep the same initial condition.

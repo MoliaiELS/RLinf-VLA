@@ -16,9 +16,10 @@ commit="${8:?fixed complete Git commit}"
 default_config="robotwin_${algorithm}_xvla_acceptance"
 if [[ "${XVLA_SAMPLER_DIAGNOSTIC:-0}" == 1 ]]; then default_config="robotwin_${algorithm}_xvla"; fi
 config="${9:-$default_config}"
+if (( $# >= 9 )); then shift 9; else shift 8; fi
 [[ "$algorithm" == ppo || "$algorithm" == grpo ]]
 [[ "$config" == "robotwin_${algorithm}_xvla" || "$config" == "robotwin_${algorithm}_xvla_acceptance" ]]
-[[ "$minutes" =~ ^[0-9]+$ && "$minutes" -ge 1 && "$minutes" -le 30 ]]
+[[ "$minutes" =~ ^[0-9]+$ && "$minutes" -ge 1 && "$minutes" -le 90 ]]
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
 [[ "$output_root" = /* && "$output_root" != / ]]
 test "$(git -C "$repo" rev-parse HEAD)" = "$commit"
@@ -36,7 +37,7 @@ export WARP_CACHE_PATH="$XVLA_RUN_DIR/warp-cache"
 ray_temp="/tmp/xvla_rl_${USER}_${SLURM_JOB_ID}"
 mkdir -p "$XVLA_RUN_DIR" "$WARP_CACHE_PATH"
 test ! -e "$XVLA_RUN_DIR/online-job.json"
-python - "$repo" "$commit" "$minutes" <<'PY'
+python - "$repo" "$commit" "$minutes" "$config" "$@" <<'PY'
 import json
 import os
 import pathlib
@@ -45,6 +46,7 @@ import time
 
 record = {
     "code_root": sys.argv[1], "code_commit": sys.argv[2],
+    "config_name": sys.argv[4], "overrides": sys.argv[5:],
     "time_limit_minutes": int(sys.argv[3]), "started_epoch": time.time(),
     "job_id": os.environ["SLURM_JOB_ID"], "hostname": os.uname().nodename,
     "python": sys.executable, "prefix": sys.prefix,
@@ -83,4 +85,4 @@ trap 'exit 130' INT
 seconds=$((minutes * 60 - 60))
 if (( seconds < 30 )); then seconds=30; fi
 cd "$repo"
-timeout --signal=TERM --kill-after=15s "${seconds}s" bash tools/xvla/train.sh "$config" "runner.logger.log_path=$XVLA_RUN_DIR"
+timeout --signal=TERM --kill-after=15s "${seconds}s" bash tools/xvla/train.sh "$config" "runner.logger.log_path=$XVLA_RUN_DIR" "$@"

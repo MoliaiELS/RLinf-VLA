@@ -165,6 +165,8 @@ GRPO 每组四个环境，使用 actor loss，不创建 value head。组内共�
    export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-grpo-acceptance
    XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_grpo_xvla_acceptance
 
+计算节点提交器 ``tools/xvla/online_submit.py`` 默认申请 20 分钟，``--time-minutes`` 支持 1 至 90 分钟。多轮 GRPO 检查建议预留 60 分钟，包含仿真、评估及 checkpoint 校验。重复传入 ``--override KEY=VALUE`` 可将 Hydra 设置作为原样参数交给训练入口；续训时用它保留原环境拓扑，并设置 checkpoint 和采集轮数上限。登录节点调试入口仍单独限制每次运行少于 25 分钟，更长的运行使用 Slurm。
+
 验收配置设置 ``env.train.reset_seed_mode=cycle``，各组初态按原训练池 ``12000``–``12003`` 的顺序轮换，到末尾后从头继续。GRPO 组内成员仍共享同一初态。评估池 ``13000``–``13003`` 保持独立。
 
 即使 GRPO 整批组都被过滤，采集轮次仍会推进 ``global_step``。空批跳过 optimizer 和 scheduler，保留模型与 Adam 状态，不计有效更新。六轮内未达到三次有效更新时，验收失败。PPO 保留没有正奖励的批次，但仍须产生有限、非零的 policy 梯度和实际参数变化，才计入有效更新。

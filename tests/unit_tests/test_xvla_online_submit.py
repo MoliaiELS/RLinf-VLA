@@ -25,6 +25,7 @@ import time
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -129,7 +130,7 @@ def test_acceptance_config_is_forwarded_without_changing_default_submission(algo
         {"output_root": "/storage/../root"},
         {"output_root": "/storage/user/models/X-VLA-RoboTwin2-pinned/results"},
         {"output_root": "/storage/user/\nresults"},
-        {"time_minutes": 31},
+        {"time_minutes": 91},
         {"time_minutes": 0},
         {"cpus": 64},
         {"gpu": "all"},
@@ -143,6 +144,14 @@ def test_acceptance_config_is_forwarded_without_changing_default_submission(algo
         {"after_job": "21038:21039"},
         {"after_job": "21038;true"},
         {"after_job": "21038\n"},
+        {"overrides": ("",)},
+        {"overrides": ("runner.max_steps",)},
+        {"overrides": ("=8",)},
+        {"overrides": ("runner.max_steps=",)},
+        {"overrides": ("runner.max_steps=8=9",)},
+        {"overrides": ("runner.max_steps=8\n",)},
+        {"overrides": ("runner.max_steps=8\r",)},
+        {"overrides": ("runner.max_steps=8\0",)},
     ],
 )
 def test_invalid_paths_or_unbounded_resources_are_rejected(override):
@@ -199,6 +208,165 @@ def test_dependency_is_rendered_as_afterany_without_changing_other_resources():
     assert "--gres=gpu:4090:1" in dependency
     assert "--cpus-per-task=8" in dependency
     assert "--time=00:30:00" in dependency
+
+
+@pytest.mark.parametrize(
+    ("minutes", "expected"),
+    [(1, "00:01:00"), (30, "00:30:00"), (60, "01:00:00"), (90, "01:30:00")],
+)
+def test_compute_node_duration_formatting_preserves_all_other_resources(
+    minutes, expected
+):
+    config = replace(plan(), algorithm="grpo", after_job="21038")
+    regular = sbatch_command(config)
+    actual = sbatch_command(replace(config, time_minutes=minutes))
+    regular[regular.index("--time=00:20:00")] = f"--time={expected}"
+    regular[-3] = str(minutes)
+    assert actual == regular
+    assert "--exclude=4090node1" in actual
+
+
+def bash_executable():
+    bash = shutil.which("bash")
+    if bash is None:
+        candidate = Path("C:/Program Files/Git/bin/bash.exe")
+        if not candidate.is_file():
+            pytest.skip("Bash is unavailable for the launcher argument contract")
+        bash = str(candidate)
+    return bash
+
+
+def test_online_job_forwards_literal_overrides_after_config_and_logger(tmp_path):
+    source = (
+        Path(__file__).resolve().parents[2] / "tools/xvla/online_job.sh"
+    ).read_text()
+    parser = source.split('algorithm="${6:', 1)[1]
+    parser = 'algorithm="${6:' + parser.split('[[ "$algorithm"', 1)[0]
+    lines = source.splitlines()
+    guard = next(line for line in lines if line.startswith('[[ "$minutes"'))
+    seconds = next(line for line in lines if line.startswith("seconds="))
+    minimum = next(line for line in lines if line.startswith("if (( seconds"))
+    launch = next(line for line in lines if line.startswith("timeout --signal="))
+    script = (
+        "set -euo pipefail\n"
+        + parser
+        + guard
+        + "\n"
+        + seconds
+        + "\n"
+        + minimum
+        + '\ntimeout() { printf "%s\\0" "$@"; }\n'
+        + launch
+    )
+    config = plan()
+    fixed = [
+        config.repo,
+        config.env_prefix,
+        config.output_root,
+        config.robotwin_root,
+        config.model_path,
+        "ppo",
+        "60",
+        config.commit,
+    ]
+    overrides = (
+        "runner.resume_dir=/storage/old run/global_step_4",
+        "runner.max_steps=8",
+        "env.train.reset_seeds=[12002, 12003]",
+        "runner.logger.experiment_name=$(touch unexpected)",
+    )
+    explicit = sbatch_command(replace(config, time_minutes=60, overrides=overrides))
+    assert explicit[-len(overrides) - 1 :] == [
+        "robotwin_ppo_xvla_acceptance",
+        *overrides,
+    ]
+    for tail in ([], ["robotwin_ppo_xvla_acceptance", *overrides]):
+        result = subprocess.run(
+            [bash_executable(), "-c", script, "--", *fixed, *tail],
+            env=dict(
+                os.environ, XVLA_RUN_DIR="/storage/new run", XVLA_SAMPLER_DIAGNOSTIC="0"
+            ),
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+        actual = result.stdout.rstrip(b"\0").decode().split("\0")
+        assert actual == [
+            "--signal=TERM",
+            "--kill-after=15s",
+            "3540s",
+            "bash",
+            "tools/xvla/train.sh",
+            "robotwin_ppo_xvla_acceptance",
+            "runner.logger.log_path=/storage/new run",
+            *(overrides if tail else ()),
+        ]
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "minutes,allowed",
+    [(1, True), (30, True), (60, True), (90, True), (0, False), (91, False)],
+)
+def test_online_job_enforces_the_same_compute_time_bounds(minutes, allowed):
+    source = (
+        Path(__file__).resolve().parents[2] / "tools/xvla/online_job.sh"
+    ).read_text()
+    guard = next(
+        line for line in source.splitlines() if line.startswith('[[ "$minutes"')
+    )
+    result = subprocess.run(
+        [bash_executable(), "-c", 'minutes="$1"\n' + guard, "--", str(minutes)]
+    )
+    assert (result.returncode == 0) is allowed
+
+
+def test_online_job_receipt_records_the_config_and_literal_overrides(
+    tmp_path, monkeypatch
+):
+    source = (
+        Path(__file__).resolve().parents[2] / "tools/xvla/online_job.sh"
+    ).read_text()
+    metadata = source.split("<<'PY'\n", 1)[1].split("\nPY", 1)[0]
+    overrides = [
+        "runner.resume_dir=/storage/checkpoint path/global_step_4",
+        "runner.max_steps=8",
+        "env.eval.total_num_envs=1",
+    ]
+    config = plan()
+    for key, value in {
+        "XVLA_RUN_DIR": str(tmp_path),
+        "SLURM_JOB_ID": "12345",
+        "SLURM_CPUS_PER_TASK": "8",
+        "CUDA_VISIBLE_DEVICES": "GPU-test",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        os, "uname", lambda: SimpleNamespace(nodename="compute-test"), raising=False
+    )
+    monkeypatch.setattr(
+        os,
+        "sysconf",
+        lambda key: 4096 if key == "SC_PAGE_SIZE" else 1024,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "-",
+            config.repo,
+            config.commit,
+            "60",
+            "robotwin_ppo_xvla_acceptance",
+            *overrides,
+        ],
+    )
+    exec(compile(metadata, "<online-job-receipt>", "exec"), {})
+    receipt = json.loads((tmp_path / "online-job.json").read_text())
+    assert receipt["time_limit_minutes"] == 60
+    assert receipt["config_name"] == "robotwin_ppo_xvla_acceptance"
+    assert receipt["overrides"] == overrides
 
 
 def test_scoped_cleanup_keeps_other_users_jobs_and_similar_directory_names():
@@ -624,12 +792,7 @@ def test_cleanup_marker_uses_real_slurm_or_explicit_bounded_login_identity(monke
 
 
 def test_login_training_argument_count_and_literal_hydra_forwarding(tmp_path):
-    bash = shutil.which("bash")
-    if bash is None:
-        candidate = Path("C:/Program Files/Git/bin/bash.exe")
-        if not candidate.is_file():
-            pytest.skip("Bash is unavailable for the launcher argument contract")
-        bash = str(candidate)
+    bash = bash_executable()
     launcher = Path(__file__).resolve().parents[2] / "tools/xvla/login_training.sh"
     parser = launcher.read_text().split('\nparse_login_training_arguments "$@"', 1)[0]
     command = (
@@ -676,14 +839,25 @@ def test_login_training_argument_count_and_literal_hydra_forwarding(tmp_path):
 @pytest.mark.parametrize("sampler_diagnostic", [False, True])
 @pytest.mark.parametrize("config_name", [None, "robotwin_ppo_xvla_acceptance"])
 @pytest.mark.parametrize("after_job", [None, "21038"])
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        (),
+        (
+            "runner.resume_dir=/storage/checkpoint path/global_step_4",
+            "env.train.reset_seeds=[12002, 12003]",
+        ),
+    ],
+)
 def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
-    tmp_path, sampler_diagnostic, config_name, after_job
+    tmp_path, sampler_diagnostic, config_name, after_job, overrides
 ):
     config = replace(
         plan(),
         sampler_diagnostic=sampler_diagnostic,
         config_name=config_name,
         after_job=after_job,
+        overrides=overrides,
     )
     script = Path(__file__).resolve().parents[2] / "tools/xvla/online_submit.py"
     args = []
@@ -703,6 +877,8 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
         args.extend(("--config-name", config_name))
     if after_job is not None:
         args.extend(("--after-job", after_job))
+    for override in overrides:
+        args.extend(("--override", override))
     completed = subprocess.run(
         [sys.executable, str(script), *args, "--dry-run"],
         check=True,
@@ -714,5 +890,6 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
     assert result["dry_run"] is True
     assert result["plan"]["sampler_diagnostic"] is sampler_diagnostic
     assert result["plan"]["after_job"] == after_job
+    assert result["plan"]["overrides"] == list(overrides)
     assert result["command"] == sbatch_command(config)
     assert not list(tmp_path.iterdir())

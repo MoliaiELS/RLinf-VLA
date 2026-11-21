@@ -49,6 +49,7 @@ class Submission:
     sampler_diagnostic: bool = False
     config_name: str | None = None
     after_job: str | None = None
+    overrides: tuple[str, ...] = ()
 
     def validate(self) -> None:
         """Reject paths or resources outside the short-test contract."""
@@ -93,9 +94,9 @@ class Submission:
             raise ValueError("The short test requires one known 4090 or 3090 GPU")
         if self.cpus not in {8, 16}:
             raise ValueError("The short test requires 8 or 16 CPU cores")
-        if not 1 <= self.time_minutes <= 30:
+        if not 1 <= self.time_minutes <= 90:
             raise ValueError(
-                "The short-test time limit must be between 1 and 30 minutes"
+                "The compute-node acceptance time limit must be between 1 and 90 minutes"
             )
         if re.fullmatch(r"[A-Za-z0-9_.-]+", self.partition) is None:
             raise ValueError("Invalid Slurm partition name")
@@ -106,6 +107,16 @@ class Submission:
             raise ValueError(
                 "--after-job must be one canonical positive numeric Slurm job ID"
             )
+        for override in self.overrides:
+            if (
+                not isinstance(override, str)
+                or override.count("=") != 1
+                or any(char in override for char in "\r\n\0")
+                or not all(override.split("="))
+            ):
+                raise ValueError(
+                    "Each --override must be a nonempty key=value on one line"
+                )
 
 
 @dataclass(frozen=True)
@@ -174,7 +185,8 @@ def require_submission_capacity(
 def sbatch_command(plan: Submission) -> list[str]:
     """Build an argv vector without changing the task, reward or model settings."""
     plan.validate()
-    duration = f"00:{plan.time_minutes:02d}:00"
+    hours, minutes = divmod(plan.time_minutes, 60)
+    duration = f"{hours:02d}:{minutes:02d}:00"
     logs = PurePosixPath(plan.output_root) / "slurm"
     job_name = (
         "xvla-sampler-diagnostic"
@@ -213,6 +225,7 @@ def sbatch_command(plan: Submission) -> list[str]:
         or f"robotwin_{plan.algorithm}_xvla"
         + ("" if plan.sampler_diagnostic else "_acceptance")
     )
+    command.extend(plan.overrides)
     return command
 
 
@@ -621,6 +634,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sampler-diagnostic", action="store_true")
     parser.add_argument("--config-name")
     parser.add_argument("--after-job")
+    parser.add_argument("--override", dest="overrides", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -637,6 +651,7 @@ def main(argv: list[str] | None = None) -> None:
         result = cleanup_job_ray(cleanup.cleanup_ray_temp)
     else:
         args = arguments(values)
+        args.overrides = tuple(args.overrides)
         plan = Submission(
             **{key: value for key, value in vars(args).items() if key != "dry_run"}
         )
