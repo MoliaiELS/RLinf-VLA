@@ -70,6 +70,29 @@ def test_full_path_density_preserves_small_mean_changes_at_native_scales():
     assert 0 < (after["logprobs"] - before["logprobs"]).abs().item() < 0.01
 
 
+def test_native_scale_density_and_entropy_match_independent_double_gaussian():
+    sampler = FlowSampler(steps=1, action_dim=20, noise_std=[0.003] * 20)
+    predictor = AffineClean(bias=0.2)
+    z = torch.linspace(-0.7, 0.9, 600).reshape(1, 30, 20)
+    mean, std = sampler._transition(
+        predictor, z, torch.zeros(1, 20), 0, context=None, deterministic=False
+    )
+    q = mean.detach() + std.detach() * torch.linspace(-1.7, 2.3, 600).reshape_as(z)
+    actual = sampler.recompute(predictor, torch.stack((z, q), 1), torch.zeros(1, 20))
+    expected = _independent_logprob(z, torch.zeros_like(z), torch.ones_like(z))
+    expected += _independent_logprob(q, mean, std)
+    entropy = torch.distributions.Normal(mean.double(), std.double()).entropy().sum()
+    entropy += (
+        torch.distributions.Normal(
+            torch.zeros_like(z).double(), torch.ones_like(z).double()
+        )
+        .entropy()
+        .sum()
+    )
+    torch.testing.assert_close(actual["logprobs"], expected, rtol=0, atol=1e-10)
+    torch.testing.assert_close(actual["entropy"].sum(), entropy, rtol=0, atol=1e-10)
+
+
 def test_single_transition_density_and_clean_mean_score_match_analytic_gaussian():
     predictor = AffineClean()
     sampler = FlowSampler(steps=1, action_dim=2, noise_std=[0.3, 0.8])
