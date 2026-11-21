@@ -67,7 +67,8 @@ bounded_training() {
     cleanup() {
         result=$?
         trap - EXIT TERM INT
-        if [[ -n "$watcher_pid" ]]; then kill "$watcher_pid" 2>/dev/null || true; fi
+        touch "$XVLA_RUN_DIR/resource-watcher-stop"
+        if [[ -n "$watcher_pid" ]]; then wait "$watcher_pid" 2>/dev/null || true; fi
         cleanup_result=0
         python "$repo/tools/xvla/online_submit.py" --cleanup-ray-temp "$RAY_TMPDIR" > "$XVLA_RUN_DIR/cleanup.json" 2> "$XVLA_RUN_DIR/cleanup.err" || cleanup_result=$?
         if [[ "$result" == 0 && "$cleanup_result" != 0 ]]; then result="$cleanup_result"; fi
@@ -115,28 +116,21 @@ record = {
 PY
     python - <<'PY' &
 import csv, json, os, pathlib, signal, subprocess, time
+from tools.xvla.online_submit import LoginProcessTracker, acceptance_finished
 
 root = pathlib.Path(os.environ["XVLA_RUN_DIR"])
 spill = pathlib.Path(os.environ["FYP_XVLA_RAY_SPILL"])
 uuid = os.environ["CUDA_VISIBLE_DEVICES"]
-run_tag = ("XVLA_LOGIN_RUN_ID=" + os.environ["XVLA_LOGIN_RUN_ID"]).encode()
+tracker = LoginProcessTracker(os.getuid(), os.environ["XVLA_LOGIN_RUN_ID"], os.environ["RAY_TMPDIR"])
 while True:
     time.sleep(1)
+    if (root / "resource-watcher-stop").exists() or acceptance_finished(root):
+        break
     reason = None
     try:
         text = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader,nounits"], text=True, timeout=5)
-        foreign = []
-        for row in csv.reader(text.splitlines()):
-            if not row or row[0].strip().lower() != uuid.lower():
-                continue
-            pid = int(row[1])
-            try:
-                folder = pathlib.Path("/proc") / str(pid)
-                own = folder.stat().st_uid == os.getuid()
-                if not own or run_tag not in (folder / "environ").read_bytes().split(b"\0"):
-                    foreign.append(pid)
-            except FileNotFoundError:
-                pass
+        pids = [int(row[1]) for row in csv.reader(text.splitlines()) if row and row[0].strip().lower() == uuid.lower()]
+        foreign = tracker.foreign_pids(pids)
         size = 0
         for path in spill.rglob("*"):
             try:
@@ -151,6 +145,8 @@ while True:
     except Exception as error:
         reason = {"resource_watch_failed": str(error)}
     if reason is not None:
+        if acceptance_finished(root):
+            break
         (root / "resource-stop.json").write_text(json.dumps({"reason": reason, "time": time.time()}, indent=2) + "\n")
         os.killpg(os.getpgrp(), signal.SIGTERM)
         break

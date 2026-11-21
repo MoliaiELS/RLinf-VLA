@@ -25,7 +25,7 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
@@ -315,20 +315,103 @@ def marker_processes(
         selected = expanded
 
 
-def read_process(pid: int, root: Path = Path("/proc")) -> OwnedProcess | None:
-    """Read a stable-enough Linux process identity without following other users."""
+def read_process_identity(pid: int, root: Path = Path("/proc")) -> OwnedProcess | None:
+    """Read UID, start time and state without requiring cmdline or environ access."""
     folder = root / str(pid)
     try:
         uid = folder.stat().st_uid
         stat = (folder / "stat").read_text().rsplit(") ", 1)[1].split()
+        return OwnedProcess(pid, int(stat[1]), uid, int(stat[19]), (), stat[0])
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+
+
+def read_process(pid: int, root: Path = Path("/proc")) -> OwnedProcess | None:
+    """Read a stable-enough Linux process identity without following other users."""
+    try:
+        identity = read_process_identity(pid, root)
+        if identity is None:
+            return None
         argv = tuple(
             part.decode(errors="replace")
-            for part in (folder / "cmdline").read_bytes().split(b"\0")
+            for part in (root / str(pid) / "cmdline").read_bytes().split(b"\0")
             if part
         )
-        return OwnedProcess(pid, int(stat[1]), uid, int(stat[19]), argv, stat[0])
+        return replace(identity, argv=argv)
     except (OSError, ValueError, IndexError):
         return None
+
+
+def login_environment_matches(environment: bytes, run_id: str, marker: str) -> bool:
+    """Require one exact initial environment entry for each private login tag."""
+    entries = environment.split(b"\0")
+    for key, value in (("XVLA_LOGIN_RUN_ID", run_id), ("RAY_TMPDIR", marker)):
+        prefix = os.fsencode(key + "=")
+        if [entry for entry in entries if entry.startswith(prefix)] != [
+            prefix + os.fsencode(value)
+        ]:
+            return False
+    return True
+
+
+@dataclass
+class LoginProcessTracker:
+    """Retain verified login identities across transient environment access loss."""
+
+    uid: int
+    run_id: str
+    marker: str
+    verified: set[tuple[int, int, int]] = field(default_factory=set, init=False)
+
+    def foreign_pids(
+        self, pids: Sequence[int], root: Path = Path("/proc")
+    ) -> list[int]:
+        """Reject unknown identities; cache fallback requires unchanged UID/starttime."""
+        foreign = []
+        for pid in pids:
+            try:
+                before = read_process_identity(pid, root)
+                if before is None or before.state in {"Z", "X"}:
+                    self.verified = {key for key in self.verified if key[1] != pid}
+                    continue
+                key = (before.uid, pid, before.start_time)
+                self.verified = {
+                    item for item in self.verified if item[1] != pid or item == key
+                }
+                if before.uid != self.uid:
+                    foreign.append(pid)
+                    continue
+                try:
+                    environment = (root / str(pid) / "environ").read_bytes()
+                except OSError:
+                    environment = None
+                after = read_process_identity(pid, root)
+                if after is None or after.state in {"Z", "X"}:
+                    self.verified.discard(key)
+                    continue
+                if (after.uid, pid, after.start_time) != key:
+                    self.verified.discard(key)
+                    foreign.append(pid)
+                elif environment is None:
+                    if key not in self.verified:
+                        foreign.append(pid)
+                elif login_environment_matches(environment, self.run_id, self.marker):
+                    self.verified.add(key)
+                else:
+                    self.verified.discard(key)
+                    foreign.append(pid)
+            except (OSError, ValueError, IndexError):
+                foreign.append(pid)
+        return foreign
+
+
+def acceptance_finished(folder: Path) -> bool:
+    """Stop watching resources after the acceptance entry records its final status."""
+    try:
+        result = json.loads((folder / "online-acceptance.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(result, dict) and result.get("status") in {"PASS", "FAILED"}
 
 
 def read_login_process(
@@ -339,14 +422,11 @@ def read_login_process(
     if before is None or before.uid != uid or before.state in {"Z", "X"}:
         return None
     try:
-        environment = (root / str(pid) / "environ").read_bytes().split(b"\0")
+        environment = (root / str(pid) / "environ").read_bytes()
     except OSError:
         return None
-    for key, value in (("XVLA_LOGIN_RUN_ID", run_id), ("RAY_TMPDIR", marker)):
-        prefix = os.fsencode(key + "=")
-        values = [entry for entry in environment if entry.startswith(prefix)]
-        if values != [prefix + os.fsencode(value)]:
-            return None
+    if not login_environment_matches(environment, run_id, marker):
+        return None
     after = read_process(pid, root)
     if (
         after is None

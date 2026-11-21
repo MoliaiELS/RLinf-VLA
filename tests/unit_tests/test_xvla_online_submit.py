@@ -30,8 +30,10 @@ import pytest
 
 from tools.xvla import online_submit
 from tools.xvla.online_submit import (
+    LoginProcessTracker,
     OwnedProcess,
     Submission,
+    acceptance_finished,
     cleanup_candidates,
     cleanup_job_ray,
     marker_processes,
@@ -241,6 +243,165 @@ def test_login_proc_identity_is_rechecked_after_reading_initial_environment(
     assert (
         read_login_process(101, folder.stat().st_uid, run_id, marker, tmp_path) is None
     )
+
+
+def test_tracker_allows_environment_permission_loss_only_for_verified_identity(
+    tmp_path, monkeypatch
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    folder = proc_entry(tmp_path, 101, run_id, marker)
+    uid = folder.stat().st_uid
+    tracker = LoginProcessTracker(uid, run_id, marker)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    original = Path.read_bytes
+
+    def unreadable_environment(path):
+        if path == folder / "environ":
+            raise PermissionError(str(path))
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_environment)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    assert LoginProcessTracker(uid, run_id, marker).foreign_pids([101], tmp_path) == [
+        101
+    ]
+    assert LoginProcessTracker(uid + 1, run_id, marker).foreign_pids(
+        [101], tmp_path
+    ) == [101]
+    proc_entry(tmp_path, 101, run_id, marker, start=901)
+    assert tracker.foreign_pids([101], tmp_path) == [101]
+
+
+def test_tracker_cannot_use_cached_environment_when_current_identity_is_unreadable(
+    tmp_path, monkeypatch
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    folder = proc_entry(tmp_path, 101, run_id, marker)
+    tracker = LoginProcessTracker(folder.stat().st_uid, run_id, marker)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    original = Path.read_text
+
+    def unreadable_stat(path, *args, **kwargs):
+        if path == folder / "stat":
+            raise PermissionError(str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable_stat)
+    assert tracker.foreign_pids([101], tmp_path) == [101]
+
+
+@pytest.mark.parametrize("state", ["Z", "X"])
+def test_tracker_ignores_exited_processes_when_environment_becomes_unreadable(
+    tmp_path, monkeypatch, state
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    folder = proc_entry(tmp_path, 101, run_id, marker)
+    tracker = LoginProcessTracker(folder.stat().st_uid, run_id, marker)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    proc_entry(tmp_path, 101, run_id, marker, state=state)
+    original = Path.read_bytes
+
+    def unreadable_environment(path):
+        if path == folder / "environ":
+            raise PermissionError(str(path))
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_environment)
+    assert tracker.foreign_pids([101], tmp_path) == []
+
+
+def test_tracker_rejects_readable_wrong_tags_and_reuse_during_environment_read(
+    tmp_path, monkeypatch
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    folder = proc_entry(tmp_path, 101, run_id, marker)
+    tracker = LoginProcessTracker(folder.stat().st_uid, run_id, marker)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    proc_entry(tmp_path, 101, run_id + "_other", marker)
+    assert tracker.foreign_pids([101], tmp_path) == [101]
+    proc_entry(tmp_path, 101, run_id, marker)
+    assert tracker.foreign_pids([101], tmp_path) == []
+    original = Path.read_bytes
+
+    def read_and_reuse(path):
+        value = original(path)
+        if path == folder / "environ":
+            proc_entry(tmp_path, 101, run_id, marker, start=901)
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", read_and_reuse)
+    assert tracker.foreign_pids([101], tmp_path) == [101]
+
+
+def test_acceptance_terminal_status_uses_the_actual_result_file(tmp_path):
+    assert not acceptance_finished(tmp_path)
+    path = tmp_path / "online-acceptance.json"
+    path.write_text('{"status":')
+    assert not acceptance_finished(tmp_path)
+    for status, expected in (("RUNNING", False), ("PASS", True), ("FAILED", True)):
+        path.write_text(json.dumps({"status": status}))
+        assert acceptance_finished(tmp_path) is expected
+
+
+@pytest.mark.parametrize("status", ["PASS", "FAILED"])
+def test_login_watcher_exits_before_gpu_queries_after_acceptance_terminal_status(
+    tmp_path, monkeypatch, status
+):
+    path = tmp_path / "online-acceptance.json"
+    path.write_text(json.dumps({"status": status}))
+    assert execute_login_watcher(tmp_path, monkeypatch, lambda: None) == []
+    assert not (tmp_path / "resource-stop.json").exists()
+
+
+def execute_login_watcher(folder, monkeypatch, on_query):
+    launcher = Path(__file__).resolve().parents[2] / "tools/xvla/login_training.sh"
+    blocks = [
+        part.split("\n", 1)[1].split("\nPY", 1)[0]
+        for part in launcher.read_text().split("<<'PY'")[1:]
+    ]
+    source = next(block for block in blocks if "LoginProcessTracker" in block)
+    for key, value in {
+        "XVLA_RUN_DIR": str(folder),
+        "FYP_XVLA_RAY_SPILL": str(folder / "spill"),
+        "CUDA_VISIBLE_DEVICES": "GPU-test",
+        "XVLA_LOGIN_RUN_ID": "debug_12345",
+        "RAY_TMPDIR": "/tmp/private-ray",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(os, "getuid", lambda: folder.stat().st_uid, raising=False)
+    monkeypatch.setattr(os, "getpgrp", lambda: 9999, raising=False)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    queries = []
+    signals = []
+
+    def query(*args, **kwargs):
+        queries.append(args)
+        on_query()
+        raise RuntimeError("simulated query interruption")
+
+    monkeypatch.setattr(subprocess, "check_output", query)
+    monkeypatch.setattr(os, "killpg", lambda *args: signals.append(args), raising=False)
+    exec(compile(source, str(launcher), "exec"), {})
+    assert signals == []
+    return queries
+
+
+def test_login_watcher_rechecks_terminal_status_before_signaling(tmp_path, monkeypatch):
+    path = tmp_path / "online-acceptance.json"
+    path.write_text(json.dumps({"status": "RUNNING"}))
+    queries = execute_login_watcher(
+        tmp_path, monkeypatch, lambda: path.write_text(json.dumps({"status": "PASS"}))
+    )
+    assert len(queries) == 1
+    assert not (tmp_path / "resource-stop.json").exists()
+
+
+def test_login_watcher_honors_cleanup_stop_without_signaling_a_stale_pid(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "resource-watcher-stop").touch()
+    assert execute_login_watcher(tmp_path, monkeypatch, lambda: None) == []
+    assert not (tmp_path / "resource-stop.json").exists()
 
 
 def login_cleanup_context(monkeypatch):
