@@ -13,7 +13,9 @@ model_path="${5:?verified model directory}"
 algorithm="${6:?ppo or grpo}"
 minutes="${7:?Slurm wall-time minutes}"
 commit="${8:?fixed complete Git commit}"
-config="${9:-robotwin_${algorithm}_xvla}"
+default_config="robotwin_${algorithm}_xvla_acceptance"
+if [[ "${XVLA_SAMPLER_DIAGNOSTIC:-0}" == 1 ]]; then default_config="robotwin_${algorithm}_xvla"; fi
+config="${9:-$default_config}"
 [[ "$algorithm" == ppo || "$algorithm" == grpo ]]
 [[ "$config" == "robotwin_${algorithm}_xvla" || "$config" == "robotwin_${algorithm}_xvla_acceptance" ]]
 [[ "$minutes" =~ ^[0-9]+$ && "$minutes" -ge 1 && "$minutes" -le 30 ]]

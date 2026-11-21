@@ -185,8 +185,11 @@ def sbatch_command(plan: Submission) -> list[str]:
         str(plan.time_minutes),
         plan.commit,
     ]
-    if plan.config_name is not None:
-        command.append(plan.config_name)
+    command.append(
+        plan.config_name
+        or f"robotwin_{plan.algorithm}_xvla"
+        + ("" if plan.sampler_diagnostic else "_acceptance")
+    )
     return command
 
 

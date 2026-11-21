@@ -60,7 +60,7 @@ def test_submission_uses_one_gpu_and_a_bounded_compute_node_job():
     assert "--job-name=xvla-online-ppo" in command
     assert "--export=ALL" in command
     assert not any(value.startswith("--mem") for value in command)
-    assert command[-8:] == [
+    assert command[-9:] == [
         config.repo,
         config.env_prefix,
         config.output_root,
@@ -69,13 +69,15 @@ def test_submission_uses_one_gpu_and_a_bounded_compute_node_job():
         "ppo",
         "20",
         config.commit,
+        "robotwin_ppo_xvla_acceptance",
     ]
     grpo = sbatch_command(
         replace(config, algorithm="grpo", gpu="3090", cpus=16, time_minutes=30)
     )
     assert "--gres=gpu:3090:1" in grpo
     assert "--time=00:30:00" in grpo
-    assert grpo[-3] == "grpo"
+    assert grpo[-4] == "grpo"
+    assert grpo[-1] == "robotwin_grpo_xvla_acceptance"
 
 
 def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
@@ -84,12 +86,15 @@ def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
     diagnostic = sbatch_command(replace(config, sampler_diagnostic=True))
     assert "--job-name=xvla-sampler-diagnostic" in diagnostic
     assert "--export=ALL,XVLA_SAMPLER_DIAGNOSTIC=1" in diagnostic
+    assert diagnostic[-1] == "robotwin_ppo_xvla"
     assert [
         value
-        for value in diagnostic
+        for value in diagnostic[:-1]
         if not value.startswith(("--job-name=", "--export="))
     ] == [
-        value for value in regular if not value.startswith(("--job-name=", "--export="))
+        value
+        for value in regular[:-1]
+        if not value.startswith(("--job-name=", "--export="))
     ]
 
 
@@ -97,8 +102,12 @@ def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
 def test_acceptance_config_is_forwarded_without_changing_default_submission(algorithm):
     config = replace(plan(), algorithm=algorithm)
     command = sbatch_command(config)
-    selected = f"robotwin_{algorithm}_xvla_acceptance"
-    assert sbatch_command(replace(config, config_name=selected)) == [*command, selected]
+    assert command[-1] == f"robotwin_{algorithm}_xvla_acceptance"
+    selected = f"robotwin_{algorithm}_xvla"
+    assert sbatch_command(replace(config, config_name=selected)) == [
+        *command[:-1],
+        selected,
+    ]
 
 
 @pytest.mark.parametrize(
