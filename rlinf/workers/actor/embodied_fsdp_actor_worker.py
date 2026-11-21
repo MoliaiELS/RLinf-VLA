@@ -139,6 +139,27 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
 
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save trained state without initializing an empty X-VLA Adam optimizer."""
+        if (
+            SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.XVLA
+            and isinstance(self.optimizer, (torch.optim.Adam, torch.optim.AdamW))
+            and not self.optimizer.state
+        ):
+            if self.optimizer_steps:
+                raise RuntimeError(
+                    "A trained X-VLA actor cannot checkpoint an empty Adam state"
+                )
+            # Native DCP initializes an empty Adam state by stepping the optimizer,
+            # which would advance bias correction without a real training update.
+            self.log_warning(
+                f"Skipping X-VLA checkpoint at step {step}: "
+                "ZERO_UPDATE_EMPTY_ADAM_STATE; native DCP would create a synthetic "
+                f"Adam step. No resumable checkpoint was written to {save_path}."
+            )
+            return
+        super().save_checkpoint(save_path, step)
+
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
         if model is None:

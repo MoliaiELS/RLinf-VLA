@@ -497,6 +497,156 @@ class _DensityPolicy(torch.nn.Module):
         return {"logprobs": self.weight * forward_inputs["features"]}
 
 
+@pytest.fixture
+def checkpoint_actor_factory(monkeypatch):
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+    from rlinf.scheduler import Worker
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    if dist.is_initialized():
+        pytest.skip("CPU checkpoint contract owns its single-rank process group")
+    monkeypatch.setenv("USE_LIBUV", "0")
+    monkeypatch.setattr(Worker, "torch_device_type", "cpu")
+    monkeypatch.setattr(
+        Worker,
+        "torch_platform",
+        SimpleNamespace(
+            synchronize=lambda: None,
+            ipc_collect=lambda: None,
+            empty_cache=lambda: None,
+            is_available=lambda: False,
+        ),
+    )
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}?use_libuv=0",
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=30),
+    )
+
+    def factory(optimizer_type, *, model_type="xvla", warm=False, updates=0):
+        worker = object.__new__(EmbodiedFSDPActor)
+        worker._logger = worker.logger
+        worker._stacklevel = 1
+        worker._cfg = fsdp_actor_config()
+        worker._cfg.model.model_type = model_type
+        worker._cfg.fsdp_config.save_full_model_weights = False
+        worker.cfg = OmegaConf.create({"actor": worker._cfg})
+        worker.model = FullyShardedDataParallel(
+            nn.Linear(2, 1),
+            use_orig_params=True,
+            sharding_strategy=ShardingStrategy.NO_SHARD,
+            device_id=torch.device("cpu"),
+        )
+        worker.optimizer = optimizer_type(worker.model.parameters(), lr=0.01)
+        worker.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+            worker.optimizer, 1, gamma=0.5
+        )
+        worker.optimizer_steps = updates
+        worker.version = 7
+        worker.is_weight_offloaded = False
+        worker.is_optimizer_offloaded = False
+        worker._strategy = FSDPStrategy(worker._cfg, 1, dist.group.WORLD)
+        if warm:
+            worker.model(torch.ones(1, 2)).sum().backward()
+            worker.optimizer.step()
+            worker.optimizer.zero_grad()
+            worker.lr_scheduler.step()
+        return worker
+
+    try:
+        yield factory
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+@pytest.mark.parametrize("runner_created_directory", [False, True])
+def test_normal_xvla_actor_zero_update_checkpoint_preserves_empty_adam(
+    checkpoint_actor_factory,
+    tmp_path,
+    caplog,
+    optimizer_type,
+    runner_created_directory,
+):
+    worker = checkpoint_actor_factory(optimizer_type)
+    checkpoint = tmp_path / "actor"
+    if runner_created_directory:
+        checkpoint.mkdir()  # EmbodiedRunner creates this before its actor RPC.
+    model_before = copy.deepcopy(worker.model.state_dict())
+    optimizer_before = copy.deepcopy(worker.optimizer.state_dict())
+    scheduler_before = copy.deepcopy(worker.lr_scheduler.state_dict())
+
+    worker.save_checkpoint(str(checkpoint), step=3)
+
+    torch.testing.assert_close(worker.model.state_dict(), model_before, rtol=0, atol=0)
+    torch.testing.assert_close(
+        worker.optimizer.state_dict(), optimizer_before, rtol=0, atol=0
+    )
+    assert not worker.optimizer.state
+    assert all(parameter.grad is None for parameter in worker.model.parameters())
+    assert worker.lr_scheduler.state_dict() == scheduler_before
+    assert worker.optimizer_steps == 0
+    assert worker.version == 7
+    assert "ZERO_UPDATE_EMPTY_ADAM_STATE" in caplog.text
+    assert not checkpoint.exists() or not list(checkpoint.iterdir())
+
+
+@pytest.mark.parametrize("optimizer_type", [torch.optim.Adam, torch.optim.AdamW])
+def test_normal_xvla_actor_rejects_missing_trained_adam_state(
+    checkpoint_actor_factory, tmp_path, optimizer_type
+):
+    worker = checkpoint_actor_factory(optimizer_type, updates=1)
+    with pytest.raises(RuntimeError, match="trained X-VLA.*empty Adam"):
+        worker.save_checkpoint(str(tmp_path / "actor"), step=3)
+    assert not worker.optimizer.state
+    assert worker.optimizer_steps == 1
+    assert not (tmp_path / "actor").exists()
+
+
+@pytest.mark.parametrize(
+    "model_type,optimizer_type,warm,updates",
+    [
+        ("xvla", torch.optim.Adam, True, 1),
+        # A loaded warm optimizer is safe even if the manager counter starts at 0.
+        ("xvla", torch.optim.AdamW, True, 0),
+        ("mlp_policy", torch.optim.Adam, False, 0),
+        ("xvla", torch.optim.SGD, False, 0),
+    ],
+)
+def test_normal_actor_checkpoint_keeps_native_dcp_for_supported_states(
+    checkpoint_actor_factory, tmp_path, model_type, optimizer_type, warm, updates
+):
+    worker = checkpoint_actor_factory(
+        optimizer_type, model_type=model_type, warm=warm, updates=updates
+    )
+    model_before = copy.deepcopy(worker.model.state_dict())
+    optimizer_before = copy.deepcopy(worker.optimizer.state_dict())
+    scheduler_before = copy.deepcopy(worker.lr_scheduler.state_dict())
+    checkpoint = tmp_path / "actor"
+
+    worker.save_checkpoint(str(checkpoint), step=3)
+
+    assert (checkpoint / "dcp_checkpoint" / ".metadata").is_file()
+    torch.testing.assert_close(worker.model.state_dict(), model_before, rtol=0, atol=0)
+    assert worker.lr_scheduler.state_dict() == scheduler_before
+    assert worker.optimizer_steps == updates
+    if warm or optimizer_type is torch.optim.SGD:
+        torch.testing.assert_close(
+            worker.optimizer.state_dict(), optimizer_before, rtol=0, atol=0
+        )
+    else:
+        # Other models retain upstream DCP's empty-Adam initialization behavior.
+        assert all(state["step"] == 1 for state in worker.optimizer.state.values())
+
+
 def _actor_valid_count_process(rank, init_method, output):
     import torch.distributed as dist
 

@@ -260,6 +260,7 @@ three-round interval.
 
    A zero-update run with empty Adam state records the reason
    ZERO_UPDATE_EMPTY_ADAM_STATE and does not create a resumable checkpoint.
+   The standard training entry applies the same protection.
    Use a checkpoint from a run that performed an effective update; a directory
    created by an unsuccessful acceptance run is not sufficient.
 

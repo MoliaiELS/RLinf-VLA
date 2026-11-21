@@ -189,7 +189,7 @@ checkpoint 目录包含 ``actor/dcp_checkpoint`` 及配套审计 sidecar，包�
 
 .. warning::
 
-   若没有执行过更新且 Adam 状态为空，验收记录原因 ZERO_UPDATE_EMPTY_ADAM_STATE，不创建可续训 checkpoint。续训应选择实际执行过有效更新的 checkpoint，不能仅凭失败验收留下的目录判断。
+   若没有执行过更新且 Adam 状态为空，验收记录原因 ZERO_UPDATE_EMPTY_ADAM_STATE，不创建可续训 checkpoint；标准训练入口也应用相同保护。续训应选择实际执行过有效更新的 checkpoint，不能仅凭失败验收留下的目录判断。
 
 采样与更新
 ~~~~~~~~~~
