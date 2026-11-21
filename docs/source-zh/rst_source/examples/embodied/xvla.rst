@@ -7,7 +7,7 @@ X-VLA
 
    RoboTwin 2.0 双臂任务（图片：`RoboTwin <https://robotwin-platform.github.io>`__）。
 
-在原生 RoboTwin 2.0 上运行 X-VLA 的单 GPU PPO 或 GRPO 接入检查。使用固定的 RoboTwin 权重，先准备原生仿真环境与资产，再在 Slurm 分配内启动配置。短测用于验证训练实现，不能作为 benchmark 成绩。
+在原生 RoboTwin 2.0 上运行 X-VLA 的单 GPU PPO 或 GRPO 接入检查。使用固定的 RoboTwin 权重，先准备原生仿真环境与资产，再在 Slurm 分配内完成单轮检查、多次有效更新和新进程 checkpoint 续训验收。短测用于验证训练实现，不能作为 benchmark 成绩。
 
 采样器参考 `πRL <https://arxiv.org/html/2510.25889v3>`__ 的随机转移方法。X-VLA 预测 clean action；adapter 先将它换算为 velocity，再执行 Flow-Noise 或 Flow-SDE 转移。既有冻结评测保留作者原生 clean-action 递推，作为独立评测协议。
 
@@ -16,7 +16,7 @@ X-VLA
 概览
 ----
 
-PPO 同时训练 policy 和 value head；GRPO 比较同一初态下四条独立采样轨迹。
+PPO 同时训练 policy 和 value head；GRPO 比较同一初态下四条独立采样轨迹。验收范围为下述 Easy 任务上的单 GPU、FP32、``NO_SHARD``、Flow-Noise 和 ``prompt_heads`` 微调。
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -132,6 +132,65 @@ PPO 同时训练 policy 和 value head；GRPO 比较同一初态下四条独立�
 
 GRPO 每组四个环境，使用 actor loss，不创建 value head。组内共享初态 seed，policy 独立采样。记录组内回报方差和保留率；全胜或全败组不能证明有效 GRPO 更新。
 
+验收多轮有效更新
+~~~~~~~~~~~~~~~~
+
+完成单轮检查后，使用验收配置确认训练能跨批次持续更新。从头运行验收时，两份配置都要求至少三次有效 optimizer 更新，采集轮数上限和评估、保存安排如下：
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 35 40
+
+   * - 算法
+     - 采集轮数
+     - 评估与 checkpoint
+   * - PPO
+     - 默认 3 轮
+     - 每 3 轮及最后一轮
+   * - GRPO
+     - 最多 6 轮
+     - 每 3 轮及最后一轮
+
+每次运行使用新的输出目录。运行 PPO 时，仅对本次命令启用审计：
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-ppo-acceptance
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_ppo_xvla_acceptance
+
+运行 GRPO 时使用对应配置和独立输出目录：
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-grpo-acceptance
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_grpo_xvla_acceptance
+
+验收配置设置 ``env.train.reset_seed_mode=cycle``，各组初态按原训练池 ``12000``–``12003`` 的顺序轮换，到末尾后从头继续。GRPO 组内成员仍共享同一初态。评估池 ``13000``–``13003`` 保持独立。
+
+即使 GRPO 整批组都被过滤，采集轮次仍会推进 ``global_step``。空批跳过 optimizer 和 scheduler，保留模型与 Adam 状态，不计有效更新。六轮内未达到三次有效更新时，验收失败。PPO 保留没有正奖励的批次，但仍须产生有限、非零的 policy 梯度和实际参数变化，才计入有效更新。
+
+审计将 ``audit-<pid>.jsonl`` 和 ``online-acceptance.json`` 写入 ``XVLA_RUN_DIR``。检查摘要状态，以及梯度、参数变化、权重同步、真实环境评估和 checkpoint 校验记录；完成采集预算本身不能证明验收通过。
+
+在新进程中续训
+~~~~~~~~~~~~~~
+
+已有可续训 checkpoint 后，在新进程中检查训练能否从保存状态继续。原生 distributed checkpoint（DCP）保存完整模型（包括冻结参数与 buffer）、Adam 状态、scheduler 和 actor RNG；审计 JSON sidecar 保存 actor 的训练计数与 policy version，并校验恢复后的训练状态。worker sidecar 保存 rollout、环境 worker 在回合边界的 RNG 与 reset 调度。恢复后沿原有顺序选择下一回合初态，不恢复回合中途的仿真物理状态。
+
+若 PPO 已保存 ``global_step_3``，在新的 Slurm 作业内激活相同环境、设置已准备好的路径，选择新的空输出目录，并保持任务、模型和 seed pool 一致：
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-ppo-resume
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_ppo_xvla_acceptance \
+     runner.resume_dir=/path/to/original-output/robotwin_ppo_xvla_acceptance/checkpoints/global_step_3 \
+     runner.max_epochs=4 runner.max_steps=4
+
+checkpoint 目录包含 ``actor/dcp_checkpoint`` 及配套审计 sidecar，包括 ``xvla_worker_state.pt``；续训时须一并保留。恢复校验比较模型、optimizer、scheduler、RNG 和计数。续训验收要求累计至少三次有效 optimizer 更新，其中新进程至少新增一次有效更新。最后一轮也会评估和保存，因此第 4 轮仍会检查，不受每 3 轮间隔影响。
+
+.. warning::
+
+   若没有执行过更新且 Adam 状态为空，验收记录原因 ZERO_UPDATE_EMPTY_ADAM_STATE，不创建可续训 checkpoint。续训应选择实际执行过有效更新的 checkpoint，不能仅凭失败验收留下的目录判断。
+
 采样与更新
 ~~~~~~~~~~
 
@@ -146,13 +205,15 @@ policy 缓存完整且 detached 的 20D 去噪链，并在更新时用同一批�
 
 RLinf 通过 ``[B,C,1]`` 的首个动作槽位接收联合标量，其余槽位置零。保持 ``logprob_action_dim=1`` 和 ``logprob_type=chunk_level``，确保该标量只求和一次。整块未执行时全部 mask；执行中提前终止时，已经采样的完整路径仍进入 likelihood。
 
-每个 chunk 的奖励为原生逐 anchor 奖励之和；PPO 的 ``gamma=0.99`` 按完整 chunk 折扣，300-anchor horizon 作为有限回合上限。评估使用相同 clean-to-velocity 转换的 ``flow_ode``，与作者原生冻结评测分开比较。
+每个 chunk 的奖励为原生逐 anchor 奖励之和；PPO 的 ``gamma=0.99`` 按完整 chunk 折扣，300-anchor horizon 作为有限回合上限。actor 和 critic 的 loss 归一化也按 chunk 计数：最后一块即使只执行部分 anchor，仍计一个有效宏步，与完整执行的 chunk 一致。回合上限向上取整为 chunk 数，300 个 anchor、chunk size 为 30 时共 10 个宏步。真实控制步仍由 ``executed_mask`` 计数，与宏步分开记录。
+
+评估使用相同 clean-to-velocity 转换的 ``flow_ode``，与作者原生冻结评测分开比较。
 
 可视化与结果
 ------------
 
-扩大一轮配置前，先检查奖励、actor 与 noise-head 梯度、likelihood ratio、``executed_mask``、权重同步和 checkpoint 重载。框架指标定义见 :doc:`训练指标 </rst_source/reference/metrics>`。
+扩大验收配置前，先检查奖励、actor 与 noise-head 梯度、likelihood ratio、``executed_mask``、权重同步和 checkpoint 重载。框架指标定义见 :doc:`训练指标 </rst_source/reference/metrics>`。
 
-新训练路径需要单独记录 GPU rollout 与真实更新验收。历史单臂 LIBERO 训练和 RoboTwin 冻结评测不能替代该证据，应与本轮结果分开登记。
+新训练路径需要单独记录 GPU rollout 与真实更新验收。历史单臂 LIBERO 训练和 RoboTwin 冻结评测不能替代该证据。按每次运行的实际记录填写验收状态；这些检查不能证明 benchmark 性能或 Hard 任务覆盖。
 
 对应 GPU 测试配置为 ``tests/e2e_tests/embodied`` 下的 ``robotwin_xvla_ppo_smoke`` 和 ``robotwin_xvla_grpo_smoke``，须在获配资源内使用同样准备好的路径运行。进程成功退出本身不能证明有效 GRPO 更新，仍须检查上述组内回报与梯度证据。

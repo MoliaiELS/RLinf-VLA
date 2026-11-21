@@ -9,8 +9,9 @@ X-VLA
 
 Run single-GPU PPO or GRPO integration checks for X-VLA on native RoboTwin 2.0.
 Start from the pinned RoboTwin checkpoint, prepare the native simulator and
-assets, then launch the configuration inside a Slurm allocation. These short
-runs validate the training implementation; they are not benchmark results.
+assets, then launch a single-round check inside a Slurm allocation. Follow it
+with multiple effective updates and a fresh-process checkpoint resume. These
+short runs validate the training implementation; they are not benchmark results.
 
 The sampler follows the stochastic-transition construction in
 `πRL <https://arxiv.org/html/2510.25889v3>`__. X-VLA predicts clean actions;
@@ -31,7 +32,9 @@ Overview
 --------
 
 Choose PPO to train a value head with the policy, or GRPO to compare four
-independent rollouts from a shared initial condition.
+independent rollouts from a shared initial condition. The acceptance recipe
+covers one GPU with FP32, ``NO_SHARD``, Flow-Noise, and ``prompt_heads`` tuning
+on the Easy task below.
 
 .. grid:: 2 4 4 4
    :gutter: 2
@@ -166,6 +169,100 @@ The group shares an initial seed while policy samples are independent. Record
 group reward variance and retention: an all-success or all-failure group does
 not establish an informative GRPO update.
 
+Check Multiple Effective Updates
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+After the single-round check, use an acceptance configuration to verify that
+training can continue across several batches. A fresh acceptance run requires
+at least three effective optimizer updates. Its collection-round limit and
+evaluation/checkpoint schedule are:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 35 40
+
+   * - Algorithm
+     - Collection Rounds
+     - Evaluation and Checkpoints
+   * - PPO
+     - 3 by default
+     - Every 3 rounds and at the final round
+   * - GRPO
+     - At most 6
+     - Every 3 rounds and at the final round
+
+Use a new output directory for each run. Enable the audit for this invocation
+when launching PPO:
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-ppo-acceptance
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_ppo_xvla_acceptance
+
+For GRPO, run the corresponding configuration with a separate output directory:
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-grpo-acceptance
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_grpo_xvla_acceptance
+
+These configurations set ``env.train.reset_seed_mode=cycle``. Group initial
+conditions traverse the original training pool, ``12000``–``12003``, in order
+and wrap around. Members of a GRPO group keep the same initial condition.
+The evaluation pool, ``13000``–``13003``, remains separate.
+
+A collection round advances ``global_step`` even if GRPO filters out every
+group. An empty batch skips the optimizer and scheduler without changing the
+model or Adam state; it contributes no effective update. If six rounds do not
+produce three effective updates, the acceptance run fails. PPO keeps batches
+with no positive reward, but still needs finite, nonzero policy gradients and
+an actual parameter change to count as an effective update.
+
+The audit writes ``audit-<pid>.jsonl`` and ``online-acceptance.json`` into
+``XVLA_RUN_DIR``. Inspect the summary status and the recorded gradients,
+parameter changes, weight synchronization, real-environment evaluation, and
+checkpoint checks. A completed collection budget alone does not establish
+acceptance.
+
+Resume in a Fresh Process
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Once the run has produced a resumable checkpoint, start a new process to check
+that training continues from the saved state. The native distributed checkpoint
+(DCP) saves the complete model, including frozen parameters and buffers, Adam
+state, the scheduler, and actor RNG. Audit JSON sidecars save the actor's
+training counter and policy version and verify the restored training state.
+Worker sidecars preserve the rollout and environment workers' RNG and reset
+schedules at episode boundaries. They resume the next episode's
+initial-condition selection; they do not restore a simulator in the middle of
+an episode.
+
+For a PPO checkpoint saved at ``global_step_3``, activate the same environment
+and prepared paths in a new Slurm job. Choose a new, empty output directory and
+keep the task, model, and seed pools unchanged:
+
+.. code-block:: bash
+
+   export XVLA_RUN_DIR=/path/to/personal-storage/runs/"${SLURM_JOB_ID}"-ppo-resume
+   XVLA_ONLINE_ACCEPTANCE=1 bash tools/xvla/train.sh robotwin_ppo_xvla_acceptance \
+     runner.resume_dir=/path/to/original-output/robotwin_ppo_xvla_acceptance/checkpoints/global_step_3 \
+     runner.max_epochs=4 runner.max_steps=4
+
+The checkpoint directory contains ``actor/dcp_checkpoint`` and the accompanying
+audit sidecars, including ``xvla_worker_state.pt``. Keep them together. Resume
+checks compare the restored model, optimizer, scheduler, RNG, and counters.
+Acceptance requires at least three cumulative effective optimizer updates,
+including at least one new effective update in this process.
+The final round also evaluates and saves, so round 4 is checked despite the
+three-round interval.
+
+.. warning::
+
+   A zero-update run with empty Adam state records the reason
+   ZERO_UPDATE_EMPTY_ADAM_STATE and does not create a resumable checkpoint.
+   Use a checkpoint from a run that performed an effective update; a directory
+   created by an unsuccessful acceptance run is not sufficient.
+
 Sampling and Updates
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -192,21 +289,27 @@ when a chunk terminates early.
 
 The reward sums the native per-anchor rewards inside a chunk, and PPO's
 ``gamma=0.99`` discounts whole chunks. The 300-anchor horizon is a finite
-episode limit. Evaluation uses ``flow_ode`` with the same clean-to-velocity
-conversion. Compare that evaluation protocol separately from the author's
-native frozen evaluator.
+episode limit. Actor and critic loss normalization also counts chunks: a
+partially executed final chunk counts as one valid macro step, just like a
+fully executed chunk. The episode cap is rounded up to the number of chunks
+(10 for 300 anchors and a chunk size of 30). Actual control-step counts still
+come from ``executed_mask`` and remain distinct from macro steps.
+
+Evaluation uses ``flow_ode`` with the same clean-to-velocity conversion. Compare
+that evaluation protocol separately from the author's native frozen evaluator.
 
 Visualization and Results
 -------------------------
 
 Inspect reward, actor and noise-head gradients, likelihood ratios,
 ``executed_mask``, synchronization, and checkpoint reload before extending the
-one-iteration configuration. Use :doc:`Training Metrics </rst_source/reference/metrics>`
+acceptance configuration. Use :doc:`Training Metrics </rst_source/reference/metrics>`
 for the framework metric definitions.
 
 The new training path requires its own GPU rollout and real-update acceptance
 record. Historical single-arm LIBERO training and frozen RoboTwin evaluation
-do not establish that result. Keep those records separate from this run.
+do not establish that result. Record each run's actual acceptance status;
+these checks establish neither benchmark performance nor Hard-task coverage.
 
 The equivalent GPU test configurations are ``robotwin_xvla_ppo_smoke`` and
 ``robotwin_xvla_grpo_smoke`` under ``tests/e2e_tests/embodied``. Run them inside
