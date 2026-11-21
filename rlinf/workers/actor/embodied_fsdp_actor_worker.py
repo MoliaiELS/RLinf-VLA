@@ -252,7 +252,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
             if self.cfg.algorithm.reward_type == "chunk_level":
                 loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
+                if (
+                    SupportedModel(self.cfg.actor.model.model_type)
+                    == SupportedModel.XVLA
+                ):
+                    loss_mask_sum = loss_mask.sum(dim=0, keepdim=True).expand_as(
+                        loss_mask
+                    )
+                else:
+                    loss_mask_sum = loss_mask_sum[..., -1:]
 
             rollout_batch["loss_mask"] = loss_mask
             rollout_batch["loss_mask_sum"] = loss_mask_sum
@@ -633,6 +641,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         return int(count.item())
 
+    def _loss_max_episode_steps(self) -> int:
+        """Return the episode cap in the same units as the model's loss mask."""
+        maximum = self.cfg.env.train.max_episode_steps
+        if SupportedModel(self.cfg.actor.model.model_type) == SupportedModel.XVLA:
+            chunks = self.cfg.actor.model.num_action_chunks
+            return (maximum + chunks - 1) // chunks
+        return maximum
+
     @Worker.timer("run_training")
     def run_training(self) -> dict[str, float]:
         """
@@ -846,7 +862,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
-            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+            "max_episode_steps": self._loss_max_episode_steps(),
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
             "logprob_mask": output_dict.get("logprob_mask", None),

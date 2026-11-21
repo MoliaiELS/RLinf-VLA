@@ -29,7 +29,11 @@ from torch import nn
 
 from rlinf.algorithms.advantages import compute_gae_advantages_and_returns
 from rlinf.algorithms.registry import policy_loss
-from rlinf.models.embodiment.xvla.policy import DomainEmbedding, XVLAPolicy
+from rlinf.models.embodiment.xvla.policy import (
+    DomainEmbedding,
+    XVLAPolicy,
+    pack_joint_logprob,
+)
 
 
 class VendorSpace:
@@ -695,3 +699,138 @@ def test_embodied_actor_valid_sample_count_reduces_across_cpu_ranks(monkeypatch)
                 process.terminate()
                 process.join(5)
         output.close()
+
+
+class _MacroDensityPolicy(nn.Module):
+    """Independent per-trajectory score/value derivatives for loss-unit checks."""
+
+    def __init__(self):
+        super().__init__()
+        self.score = nn.Parameter(torch.zeros(2))
+        self.value = nn.Parameter(torch.zeros(2))
+
+    def forward(self, forward_inputs, **kwargs):
+        ids = forward_inputs["trajectory_ids"].flatten()
+        return {
+            "logprobs": pack_joint_logprob(self.score[ids], 30),
+            "values": self.value[ids],
+        }
+
+
+def partial_chunk_actor_batch(
+    anchors, maximum=300, *, algorithm="grpo", model_type="xvla", success=True
+):
+    from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
+
+    worker = object.__new__(EmbodiedFSDPActor)
+    worker.cfg = OmegaConf.create(
+        {
+            "runner": {"task_type": "embodied"},
+            "actor": {
+                "model": {
+                    "model_type": model_type,
+                    "num_action_chunks": 30,
+                    "action_dim": 20,
+                    "logprob_action_dim": 1,
+                },
+                "fsdp_config": {"enable_gradient_accumulation": False},
+            },
+            "algorithm": {
+                "adv_type": "gae" if algorithm == "ppo" else "grpo",
+                "loss_type": "actor_critic" if algorithm == "ppo" else "actor",
+                "reward_type": "chunk_level",
+                "logprob_type": "chunk_level",
+                "group_size": 2,
+                "filter_rewards": algorithm == "grpo",
+                "rewards_lower_bound": 0.01,
+                "rewards_upper_bound": 0.99,
+                "entropy_bonus": 0.0,
+                "clip_ratio_high": 0.2,
+                "clip_ratio_low": 0.2,
+                "value_clip": 0.2,
+                "huber_delta": 10.0,
+            },
+            "env": {
+                "train": {
+                    "max_episode_steps": maximum,
+                    "rollout_epoch": 1,
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                }
+            },
+        }
+    )
+    chunks = (maximum + 29) // 30
+    timeline = torch.arange(1, chunks * 30 + 1).reshape(chunks, 30)
+    dones = torch.zeros(chunks + 1, 2, 30, dtype=torch.bool)
+    dones[1:, 0] = timeline >= anchors
+    dones[1:, 1] = timeline >= maximum
+    rewards = torch.zeros(chunks, 2, 30)
+    if success:
+        rewards[(anchors - 1) // 30, 0, (anchors - 1) % 30] = 1
+    batch = {
+        "dones": dones,
+        "rewards": rewards,
+        "prev_logprobs": torch.zeros(chunks, 2, 30, 1),
+        "prev_values": torch.zeros(chunks + 1, 2, 1),
+        "forward_inputs": {
+            "trajectory_ids": torch.arange(2)[None, :, None].expand(chunks, -1, -1)
+        },
+    }
+    return worker, worker._process_received_rollout_batch(batch)
+
+
+@pytest.mark.parametrize("anchors", [1, 30, 31, 109, 300])
+@pytest.mark.parametrize("maximum", [300, 400])
+@pytest.mark.parametrize("algorithm", ["ppo", "grpo"])
+def test_partial_terminal_chunks_use_macro_units_through_real_actor_loss(
+    monkeypatch, anchors, maximum, algorithm
+):
+    from rlinf.hybrid_engines.fsdp.strategy.fsdp import FSDPStrategy
+    from rlinf.scheduler import Worker
+    from rlinf.utils.nested_dict_process import process_nested_dict_for_train
+    from rlinf.utils.utils import get_loss_agg_func
+
+    worker, batch = partial_chunk_actor_batch(anchors, maximum, algorithm=algorithm)
+    chunks = (maximum + 29) // 30
+    counts = batch["loss_mask_sum"][0, :, 0]
+    torch.testing.assert_close(counts, torch.tensor([(anchors + 29) // 30, chunks]))
+    assert worker._loss_max_episode_steps() == chunks
+    # Equal-magnitude score advantages and critic errors isolate normalization units.
+    batch["advantages"] = torch.tensor([1.0, -1.0])[None, :, None].expand(
+        chunks, -1, -1
+    )
+    batch["returns"] = torch.ones(chunks, 2, 1)
+    minibatch = process_nested_dict_for_train(batch, torch.arange(chunks * 2))
+    monkeypatch.setattr(
+        Worker,
+        "torch_platform",
+        SimpleNamespace(current_device=lambda: torch.device("cpu")),
+    )
+    worker.device = torch.device("cpu")
+    worker.model = _MacroDensityPolicy()
+    worker._strategy = FSDPStrategy(worker.cfg.actor, 1)
+    worker.optimizer_steps = 1
+    worker.critic_warmup_steps = 0
+    worker.enable_sft_co_train = False
+    worker.amp_context = nullcontext()
+    worker.gradient_accumulation = 1
+    worker.grad_scaler = torch.amp.GradScaler("cpu", enabled=False)
+    worker.loss_agg_func = get_loss_agg_func("token-mean")
+    metrics = {}
+    worker.train_micro_batch(minibatch, metrics, is_last=True)
+    torch.testing.assert_close(worker.model.score.grad, torch.tensor([-0.5, 0.5]))
+    if algorithm == "ppo":
+        assert worker.model.value.grad.abs().min() > 0
+        torch.testing.assert_close(
+            worker.model.value.grad[0], worker.model.value.grad[1]
+        )
+
+
+def test_other_models_keep_anchor_normalization_and_tied_grpo_still_filters():
+    worker, batch = partial_chunk_actor_batch(31, model_type="openpi")
+    torch.testing.assert_close(batch["loss_mask_sum"][0, :, 0], torch.tensor([31, 300]))
+    assert worker._loss_max_episode_steps() == 300
+    worker, batch = partial_chunk_actor_batch(31, success=False)
+    assert not batch["loss_mask"].any()
+    torch.testing.assert_close(batch["loss_mask_sum"][0, :, 0], torch.tensor([2, 10]))
