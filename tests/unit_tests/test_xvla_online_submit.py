@@ -16,21 +16,29 @@
 
 import hashlib
 import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 
 import pytest
 
+from tools.xvla import online_submit
 from tools.xvla.online_submit import (
     OwnedProcess,
     Submission,
+    cleanup_candidates,
     cleanup_job_ray,
     marker_processes,
     parse_queue,
     private_ray_marker,
+    read_login_process,
+    read_process,
     require_submission_capacity,
     sbatch_command,
 )
@@ -170,6 +178,205 @@ def test_scoped_cleanup_keeps_other_users_jobs_and_similar_directory_names():
     ]
     selected = marker_processes(entries, uid=1000, marker=marker, exclude={40})
     assert {entry.pid for entry in selected} == {10, 11, 12}
+
+
+def proc_entry(root, pid, run_id, marker, *, parent=1, start=900, state="S", argv=None):
+    folder = root / str(pid)
+    folder.mkdir(exist_ok=True)
+    fields = [state, str(parent), *("0" for _ in range(17)), str(start), "0"]
+    (folder / "stat").write_text(f"{pid} (ray worker) " + " ".join(fields))
+    (folder / "cmdline").write_bytes(
+        b"\0".join(os.fsencode(arg) for arg in (argv or ["ray::Actor"]))
+    )
+    (folder / "environ").write_bytes(
+        os.fsencode(f"XVLA_LOGIN_RUN_ID={run_id}\0RAY_TMPDIR={marker}\0")
+    )
+    return folder
+
+
+def test_login_orphans_are_selected_through_proc_files_only_with_both_exact_tags(
+    tmp_path,
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    valid = proc_entry(tmp_path, 101, run_id, marker)
+    proc_entry(tmp_path, 102, run_id + "_other", marker)
+    proc_entry(tmp_path, 103, run_id, marker + "_other")
+    duplicate = proc_entry(tmp_path, 104, run_id, marker)
+    with (duplicate / "environ").open("ab") as stream:
+        stream.write(b"XVLA_LOGIN_RUN_ID=another_run\0")
+    proc_entry(tmp_path, 105, run_id, marker, state="Z")
+    proc_entry(tmp_path, 106, run_id, marker)
+    proc_entry(
+        tmp_path,
+        201,
+        "other_run",
+        "other_marker",
+        argv=["raylet", f"--session-dir={marker}/session"],
+    )
+    proc_entry(tmp_path, 202, "other_run", "other_marker", parent=201)
+    processes = [read_process(int(path.name), tmp_path) for path in tmp_path.iterdir()]
+    uid = valid.stat().st_uid
+    default = cleanup_candidates(processes, uid, marker, {106}, root=tmp_path)
+    login = cleanup_candidates(processes, uid, marker, {106}, run_id, tmp_path)
+    assert {process.pid for process in default} == {201, 202}
+    assert {process.pid for process in login} == {101, 201, 202}
+    assert read_process(101, tmp_path).parent_pid == 1
+    assert cleanup_candidates(processes, uid + 1, marker, set(), run_id, tmp_path) == []
+
+
+def test_login_proc_identity_is_rechecked_after_reading_initial_environment(
+    tmp_path, monkeypatch
+):
+    run_id, marker = "debug_12345", "/tmp/xvla_l_user_private"
+    folder = proc_entry(tmp_path, 101, run_id, marker)
+    original = Path.read_bytes
+
+    def read_and_reuse(path):
+        value = original(path)
+        if path == folder / "environ":
+            proc_entry(tmp_path, 101, run_id, marker, start=901)
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", read_and_reuse)
+    assert (
+        read_login_process(101, folder.stat().st_uid, run_id, marker, tmp_path) is None
+    )
+
+
+def login_cleanup_context(monkeypatch):
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.setattr("getpass.getuser", lambda: "user")
+    monkeypatch.setattr("socket.gethostname", lambda: "4090node1")
+    monkeypatch.setattr(os, "getpid", lambda: 9000)
+    monkeypatch.setattr(os, "getppid", lambda: 9001)
+    monkeypatch.setattr(signal, "SIGKILL", getattr(signal, "SIGKILL", 9), raising=False)
+    for key, value in {
+        "XVLA_LOGIN_TRAINING_DEBUG": "1",
+        "XVLA_LOGIN_RUN_ID": "debug_12345",
+        "XVLA_LOGIN_SECONDS": "1200",
+        "XVLA_LOGIN_CPUS": "4",
+    }.items():
+        monkeypatch.setenv(key, value)
+    return private_ray_marker()
+
+
+def test_cleanup_reaps_login_orphans_and_keeps_slurm_scope_unchanged(
+    tmp_path, monkeypatch
+):
+    marker = login_cleanup_context(monkeypatch)
+    folder = proc_entry(tmp_path, 101, "debug_12345", marker)
+    proc_entry(tmp_path, 9000, "debug_12345", marker, parent=9001)
+    proc_entry(tmp_path, 9001, "debug_12345", marker)
+    monkeypatch.setattr(os, "getuid", lambda: folder.stat().st_uid, raising=False)
+    calls = []
+
+    def signal_process(pid, signum):
+        calls.append((pid, signum))
+        if signum == signal.SIGKILL:
+            proc_entry(tmp_path, pid, "debug_12345", marker, state="Z")
+
+    monkeypatch.setattr(os, "kill", signal_process)
+    result = cleanup_job_ray(marker, proc_root=tmp_path)
+    assert calls == [(101, signal.SIGTERM), (101, signal.SIGKILL)]
+    assert result["remaining_pids"] == []
+    monkeypatch.delenv("XVLA_LOGIN_TRAINING_DEBUG")
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    marker = private_ray_marker()
+    proc_entry(tmp_path, 101, "debug_12345", marker)
+    calls.clear()
+    assert cleanup_job_ray(marker, proc_root=tmp_path)["remaining_pids"] == []
+    assert calls == []
+
+
+def test_cleanup_does_not_signal_a_reused_pid_after_term(tmp_path, monkeypatch):
+    marker = login_cleanup_context(monkeypatch)
+    folder = proc_entry(tmp_path, 101, "debug_12345", marker)
+    monkeypatch.setattr(os, "getuid", lambda: folder.stat().st_uid, raising=False)
+    calls = []
+
+    def reuse_process(pid, signum):
+        calls.append((pid, signum))
+        proc_entry(tmp_path, pid, "different_run", "/tmp/different", start=901)
+
+    monkeypatch.setattr(os, "kill", reuse_process)
+    result = cleanup_job_ray(marker, proc_root=tmp_path)
+    assert calls == [(101, signal.SIGTERM)]
+    assert result["remaining_pids"] == []
+
+
+def test_cleanup_cli_reports_remaining_processes_and_exits_nonzero(
+    tmp_path, monkeypatch, capsys
+):
+    marker = login_cleanup_context(monkeypatch)
+    folder = proc_entry(tmp_path, 101, "debug_12345", marker)
+    monkeypatch.setattr(os, "getuid", lambda: folder.stat().st_uid, raising=False)
+    monkeypatch.setattr(
+        os, "kill", lambda pid, signum: (folder / "environ").write_bytes(b"")
+    )
+    monkeypatch.setattr(
+        online_submit, "cleanup_job_ray", partial(cleanup_job_ray, proc_root=tmp_path)
+    )
+    with pytest.raises(SystemExit) as result:
+        online_submit.main(["--cleanup-ray-temp", marker])
+    assert result.value.code == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["remaining_pids"] == [101]
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Requires the live Linux /proc boundary",
+)
+def test_live_proc_initial_environment_contract_without_sending_signals(tmp_path):
+    run_id, marker = "debug_live_12345", str(tmp_path / "private-ray")
+    release = tmp_path / "release"
+    child = (
+        "import os,pathlib,time\n"
+        "release=pathlib.Path(os.environ['XVLA_TEST_RELEASE'])\n"
+        "deadline=time.monotonic()+5\n"
+        "while not release.exists() and time.monotonic()<deadline: time.sleep(.02)\n"
+    )
+    parent = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import os,subprocess,sys; p=subprocess.Popen([sys.executable,'-c',sys.argv[1]], "
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(os.getpid(),p.pid)",
+            child,
+        ],
+        env=dict(
+            os.environ,
+            XVLA_LOGIN_RUN_ID=run_id,
+            RAY_TMPDIR=marker,
+            XVLA_TEST_RELEASE=str(release),
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    creator_pid, pid = map(int, parent.stdout.split())
+    try:
+        identity = read_process(pid)
+        assert identity.parent_pid != creator_pid
+        verified = read_login_process(pid, os.getuid(), run_id, marker)
+        assert verified is not None and verified.start_time == identity.start_time
+        assert cleanup_candidates([identity], os.getuid(), marker, set()) == []
+        assert [
+            item.pid
+            for item in cleanup_candidates(
+                [identity], os.getuid(), marker, set(), run_id
+            )
+        ] == [pid]
+        assert read_login_process(pid, os.getuid(), run_id + "_other", marker) is None
+    finally:
+        release.touch()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            process = read_process(pid)
+            if process is None or process.state in {"Z", "X"}:
+                break
+            time.sleep(0.02)
 
 
 def test_cleanup_marker_uses_real_slurm_or_explicit_bounded_login_identity(monkeypatch):

@@ -287,6 +287,7 @@ class OwnedProcess:
     uid: int
     start_time: int
     argv: tuple[str, ...]
+    state: str = ""
 
 
 def marker_processes(
@@ -325,9 +326,60 @@ def read_process(pid: int, root: Path = Path("/proc")) -> OwnedProcess | None:
             for part in (folder / "cmdline").read_bytes().split(b"\0")
             if part
         )
-        return OwnedProcess(pid, int(stat[1]), uid, int(stat[19]), argv)
+        return OwnedProcess(pid, int(stat[1]), uid, int(stat[19]), argv, stat[0])
     except (OSError, ValueError, IndexError):
         return None
+
+
+def read_login_process(
+    pid: int, uid: int, run_id: str, marker: str, root: Path = Path("/proc")
+) -> OwnedProcess | None:
+    """Verify both initial login tags and a stable own-user process identity."""
+    before = read_process(pid, root)
+    if before is None or before.uid != uid or before.state in {"Z", "X"}:
+        return None
+    try:
+        environment = (root / str(pid) / "environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    for key, value in (("XVLA_LOGIN_RUN_ID", run_id), ("RAY_TMPDIR", marker)):
+        prefix = os.fsencode(key + "=")
+        values = [entry for entry in environment if entry.startswith(prefix)]
+        if values != [prefix + os.fsencode(value)]:
+            return None
+    after = read_process(pid, root)
+    if (
+        after is None
+        or after.uid != uid
+        or after.start_time != before.start_time
+        or after.state in {"Z", "X"}
+    ):
+        return None
+    return after
+
+
+def cleanup_candidates(
+    processes: Sequence[OwnedProcess],
+    uid: int,
+    marker: str,
+    exclude: set[int],
+    login_run_id: str | None = None,
+    root: Path = Path("/proc"),
+) -> list[OwnedProcess]:
+    """Select the marker tree, plus double-tagged login orphans only when enabled."""
+    selected = {
+        process.pid: process
+        for process in marker_processes(processes, uid, marker, exclude)
+        if process.state not in {"Z", "X"}
+    }
+    if login_run_id is not None:
+        for process in processes:
+            if process.pid in exclude or process.uid != uid:
+                continue
+            verified = read_login_process(process.pid, uid, login_run_id, marker, root)
+            if verified is not None and verified.start_time == process.start_time:
+                selected[process.pid] = verified
+    return [selected[pid] for pid in sorted(selected, reverse=True)]
 
 
 def private_ray_marker() -> str:
@@ -352,31 +404,48 @@ def private_ray_marker() -> str:
     return f"/tmp/xvla_rl_{getpass.getuser()}_{job_id}"
 
 
-def cleanup_job_ray(marker: str) -> dict:
+def cleanup_job_ray(marker: str, *, proc_root: Path = Path("/proc")) -> dict:
     """Terminate only this job's own marked Ray tree, never a shared runtime."""
     expected = private_ray_marker()
     if marker != expected:
         raise ValueError(
             f"Ray cleanup marker must be this job's private directory: {expected}"
         )
-    processes = [
-        record
-        for path in Path("/proc").iterdir()
-        if path.name.isdigit() and (record := read_process(int(path.name))) is not None
-    ]
+
+    def scan():
+        return [
+            record
+            for path in proc_root.iterdir()
+            if path.name.isdigit()
+            and (record := read_process(int(path.name), proc_root)) is not None
+        ]
+
+    processes = scan()
     by_pid = {process.pid: process for process in processes}
     ancestors = {os.getpid()}
     parent = os.getppid()
     while parent in by_pid and parent not in ancestors:
         ancestors.add(parent)
         parent = by_pid[parent].parent_pid
-    candidates = marker_processes(processes, os.getuid(), marker, ancestors)
+    uid = os.getuid()
+    login_run_id = (
+        os.environ["XVLA_LOGIN_RUN_ID"]
+        if os.environ.get("XVLA_LOGIN_TRAINING_DEBUG") == "1"
+        else None
+    )
+
+    def candidates(snapshot):
+        return cleanup_candidates(
+            snapshot, uid, marker, ancestors, login_run_id, proc_root
+        )
+
+    initial = candidates(processes)
     terminated = []
-    for process in candidates:
-        current = read_process(process.pid)
+    for process in initial:
+        current = read_process(process.pid, proc_root)
         if (
             current is not None
-            and current.uid == os.getuid()
+            and current.uid == uid
             and current.start_time == process.start_time
         ):
             try:
@@ -386,12 +455,16 @@ def cleanup_job_ray(marker: str) -> dict:
                 pass
     if terminated:
         time.sleep(2)
+    targets = {(process.pid, process.start_time): process for process in initial}
+    targets.update(
+        {(process.pid, process.start_time): process for process in candidates(scan())}
+    )
     killed = []
-    for process in candidates:
-        current = read_process(process.pid)
+    for process in targets.values():
+        current = read_process(process.pid, proc_root)
         if (
             current is not None
-            and current.uid == os.getuid()
+            and current.uid == uid
             and current.start_time == process.start_time
         ):
             try:
@@ -399,7 +472,30 @@ def cleanup_job_ray(marker: str) -> dict:
                 killed.append(process.pid)
             except ProcessLookupError:
                 pass
-    return {"ray_temp": marker, "terminated_pids": terminated, "killed_pids": killed}
+
+    def survivors():
+        snapshot = scan()
+        selected = {process.pid: process for process in candidates(snapshot)}
+        for process in snapshot:
+            if (
+                (process.pid, process.start_time) in targets
+                and process.uid == uid
+                and process.state not in {"Z", "X"}
+            ):
+                selected[process.pid] = process
+        return [selected[pid] for pid in sorted(selected)]
+
+    remaining = survivors()
+    deadline = time.monotonic() + 2
+    while remaining and time.monotonic() < deadline:
+        time.sleep(0.1)
+        remaining = survivors()
+    return {
+        "ray_temp": marker,
+        "terminated_pids": terminated,
+        "killed_pids": killed,
+        "remaining_pids": [process.pid for process in remaining],
+    }
 
 
 def arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -446,6 +542,8 @@ def main(argv: list[str] | None = None) -> None:
         else:
             result = submit(plan)
     sys.stdout.write(json.dumps(result, indent=2) + "\n")
+    if result.get("remaining_pids"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
