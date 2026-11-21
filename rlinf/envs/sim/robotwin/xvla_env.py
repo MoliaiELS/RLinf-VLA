@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import gc
 from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
@@ -37,15 +38,16 @@ class NativeTask:
         self.module, task_type, self.config, _ = runner.load_native(
             root, cfg.task_name, cfg.condition
         )
-        self.env = task_type()
+        self._task_type = task_type
+        self.env = None
         self.task_name = cfg.task_name
         self.runner = runner
         self.initialized = False
         self.budget = protocol.Budget()
 
     def reset(self, index: int, seed: int) -> None:
-        if self.initialized:
-            self.close()
+        self.close()
+        self.env = self._task_type()
         self.budget = protocol.Budget()
         try:
             self.runner.reset_env(
@@ -57,7 +59,7 @@ class NativeTask:
             self.initialized = True
         except Exception:
             with suppress(Exception):
-                self.env.close_env(clear_cache=False)
+                self.close()
             raise
 
     def observe(self) -> dict:
@@ -73,9 +75,18 @@ class NativeTask:
         self.env.take_action(command, action_type="ee")
 
     def close(self) -> None:
-        if self.initialized:
-            self.env.close_env(clear_cache=False)
-            self.initialized = False
+        episode = self.env
+        self.env = None
+        self.initialized = False
+        if episode is None:
+            return
+        try:
+            episode.close_env(clear_cache=False)
+        finally:
+            # Pinned close_env delegates to Gym's no-op close; planners retain scenes.
+            episode.__dict__.clear()
+            del episode
+            gc.collect()
 
 
 class XVLARoboTwinEnv:
@@ -118,6 +129,9 @@ class XVLARoboTwinEnv:
             )
         if len(set(seeds)) != len(seeds):
             raise ValueError("reset_seeds must not contain duplicate initial seeds")
+        self.reset_seed_mode = cfg.get("reset_seed_mode", "random")
+        if self.reset_seed_mode not in ("random", "cycle"):
+            raise ValueError("reset_seed_mode must be random or cycle")
         self.cfg = cfg
         self.num_envs = num_envs
         self.num_group = num_envs // self.group_size
@@ -135,6 +149,7 @@ class XVLARoboTwinEnv:
             raise ValueError("reward_coef must be finite and positive")
         self._seed_pool = np.asarray(seeds, dtype=np.int64)
         self._generator = np.random.default_rng(self.seed)
+        self._cycle_cursor = 0
         self._tasks = []
         try:
             for _ in range(num_envs):
@@ -178,10 +193,109 @@ class XVLARoboTwinEnv:
             self, "reset_state_ids"
         ):
             return
-        indices = self._generator.integers(0, len(self._seed_pool), size=self.num_group)
+        if self.reset_seed_mode == "cycle":
+            indices = (np.arange(self.num_group) + self._cycle_cursor) % len(
+                self._seed_pool
+            )
+            self._cycle_cursor += self.num_group
+        else:
+            indices = self._generator.integers(
+                0, len(self._seed_pool), size=self.num_group
+            )
         self.reset_state_ids = torch.from_numpy(
             np.repeat(self._seed_pool[indices], self.group_size).copy()
         )
+
+    def _schedule_metadata(self) -> dict:
+        return {
+            "version": 1,
+            "seed_pool": self._seed_pool.tolist(),
+            "reset_seed_mode": self.reset_seed_mode,
+            "group_size": self.group_size,
+            "num_envs": self.num_envs,
+            "seed": self.seed,
+            "seed_offset": self.seed_offset,
+            "total_num_processes": self.total_num_processes,
+            "use_fixed_reset_state_ids": bool(
+                self.cfg.get("use_fixed_reset_state_ids", False)
+            ),
+            "task_name": self.cfg.task_name,
+            "condition": self.cfg.condition,
+        }
+
+    def get_reset_schedule_state(self) -> dict:
+        """Export next-episode scheduling at a fresh or completed episode boundary."""
+        if self._closed or (
+            any(task.initialized for task in self._tasks)
+            and not bool((self._terminations | self._truncations).all())
+        ):
+            raise RuntimeError("Export reset scheduling only at an episode boundary")
+        return {
+            **self._schedule_metadata(),
+            "generator_state": deepcopy(self._generator.bit_generator.state),
+            "cycle_cursor": self._cycle_cursor,
+            "reset_count": self._reset_count,
+            "reset_state_ids": self.reset_state_ids.tolist(),
+        }
+
+    def set_reset_schedule_state(self, state: dict) -> None:
+        """Restore scheduling into a fresh environment without restoring physics."""
+        if self._closed or self._reset_count:
+            raise RuntimeError("Restore reset scheduling before the first episode")
+        if any(
+            type(state.get(key)) is not type(value) or state.get(key) != value
+            for key, value in self._schedule_metadata().items()
+        ):
+            raise ValueError("Reset schedule metadata does not match this environment")
+        for name in ("cycle_cursor", "reset_count"):
+            value = state.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Reset schedule {name} must be a nonnegative integer")
+        seeds = state.get("reset_state_ids")
+        if not isinstance(seeds, list):
+            raise ValueError(
+                "Reset schedule must include selected next reset_state_ids"
+            )
+        seeds = self._validate_reset_seeds(seeds)
+        if self.reset_seed_mode == "cycle":
+            cursor = state["cycle_cursor"]
+            expected = np.repeat(
+                self._seed_pool[
+                    (np.arange(self.num_group) + cursor - self.num_group)
+                    % len(self._seed_pool)
+                ],
+                self.group_size,
+            ).tolist()
+            if cursor < self.num_group or seeds != expected:
+                raise ValueError("Cycle cursor does not match the selected next seeds")
+        elif state["cycle_cursor"] != 0:
+            raise ValueError("Random reset scheduling requires a zero cycle cursor")
+        generator = np.random.default_rng()
+        try:
+            generator.bit_generator.state = deepcopy(state["generator_state"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "Reset schedule requires a compatible NumPy RNG state"
+            ) from error
+        self._generator = generator
+        self._cycle_cursor = state["cycle_cursor"]
+        self._reset_count = state["reset_count"]
+        self.reset_state_ids = torch.tensor(seeds, dtype=torch.long)
+
+    def _validate_reset_seeds(self, seeds: list) -> list[int]:
+        if len(seeds) != self.num_envs or any(
+            isinstance(seed, bool) or int(seed) != seed or seed not in self._seed_pool
+            for seed in seeds
+        ):
+            raise ValueError(
+                "Reset seeds must belong to the configured initial-state pool"
+            )
+        if any(
+            len(set(seeds[start : start + self.group_size])) != 1
+            for start in range(0, self.num_envs, self.group_size)
+        ):
+            raise ValueError("Every GRPO group must reset to the same native seed")
+        return [int(seed) for seed in seeds]
 
     def _observations(self, reset: bool = False) -> dict:
         values = [protocol.observation_values(obs) for obs in self._raw_obs]
@@ -201,17 +315,7 @@ class XVLARoboTwinEnv:
         if env_idx is not None:
             raise ValueError("Native grouped episodes require a full-batch reset")
         seeds = self.reset_state_ids.tolist() if env_seeds is None else list(env_seeds)
-        if len(seeds) != self.num_envs or any(
-            seed not in self._seed_pool for seed in seeds
-        ):
-            raise ValueError(
-                "Reset seeds must belong to the configured initial-state pool"
-            )
-        if any(
-            len(set(seeds[start : start + self.group_size])) != 1
-            for start in range(0, self.num_envs, self.group_size)
-        ):
-            raise ValueError("Every GRPO group must reset to the same native seed")
+        seeds = self._validate_reset_seeds(seeds)
         self._elapsed_steps.zero_()
         self._terminations.zero_()
         self._truncations.zero_()
@@ -281,37 +385,49 @@ class XVLARoboTwinEnv:
         terminations = torch.zeros_like(rewards, dtype=torch.bool)
         truncations = torch.zeros_like(rewards, dtype=torch.bool)
         executed = torch.zeros_like(rewards, dtype=torch.bool)
-        for index, (task, native_commands) in enumerate(zip(self._tasks, commands)):
-            with task.action_context():
-                for slot, command in enumerate(native_commands):
-                    if not (self._terminations[index] or self._truncations[index]):
-                        before = int(task.env.take_action_cnt)
-                        limit = min(self.max_episode_steps, int(task.env.step_lim))
-                        if before >= limit:
-                            self._truncations[index] = True
-                        else:
-                            task.take_action(command)
-                            after = int(task.env.take_action_cnt)
-                            if after != before + 1:
-                                raise RuntimeError(
-                                    "Native action did not advance its action counter once"
-                                )
-                            task.budget.anchors_sent += 1
-                            task.budget.anchors = after
-                            self._elapsed_steps[index] += 1
-                            executed[index, slot] = True
-                            self._raw_obs[index] = task.observe()
-                            if task.env.check_success():
-                                self._success[index] = True
-                                self._terminations[index] = True
-                                rewards[index, slot] = self.reward_coef
-                                self._returns[index] += self.reward_coef
-                            elif not bool(task.env.actor_pose):
-                                self._terminations[index] = True
-                            elif after >= limit:
+        try:
+            for index, (task, native_commands) in enumerate(zip(self._tasks, commands)):
+                if self._terminations[index] or self._truncations[index]:
+                    terminations[index] = self._terminations[index]
+                    truncations[index] = self._truncations[index]
+                    continue
+                with task.action_context():
+                    for slot, command in enumerate(native_commands):
+                        if not (self._terminations[index] or self._truncations[index]):
+                            before = int(task.env.take_action_cnt)
+                            limit = min(self.max_episode_steps, int(task.env.step_lim))
+                            if before >= limit:
                                 self._truncations[index] = True
-                    terminations[index, slot] = self._terminations[index]
-                    truncations[index, slot] = self._truncations[index]
+                            else:
+                                task.take_action(command)
+                                after = int(task.env.take_action_cnt)
+                                if after != before + 1:
+                                    raise RuntimeError(
+                                        "Native action did not advance its action counter once"
+                                    )
+                                task.budget.anchors_sent += 1
+                                task.budget.anchors = after
+                                self._elapsed_steps[index] += 1
+                                executed[index, slot] = True
+                                self._raw_obs[index] = task.observe()
+                                if task.env.check_success():
+                                    self._success[index] = True
+                                    self._terminations[index] = True
+                                    rewards[index, slot] = self.reward_coef
+                                    self._returns[index] += self.reward_coef
+                                elif not bool(task.env.actor_pose):
+                                    self._terminations[index] = True
+                                elif after >= limit:
+                                    self._truncations[index] = True
+                        terminations[index, slot] = self._terminations[index]
+                        truncations[index, slot] = self._truncations[index]
+                if self._terminations[index] or self._truncations[index]:
+                    self._raw_obs[index] = deepcopy(self._raw_obs[index])
+                    task.close()
+        except Exception:
+            with suppress(Exception):
+                self.close()
+            raise
         obs = self._observations()
         infos = {
             "episode": self._episode_info(),
