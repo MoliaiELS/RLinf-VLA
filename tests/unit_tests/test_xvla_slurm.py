@@ -23,6 +23,9 @@ import json
 import logging
 import os
 import re
+import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 import warnings
@@ -60,6 +63,7 @@ def _execute_source_nodes(nodes, namespace):
 
 class SlurmRayTests(unittest.TestCase):
     def setUp(self):
+        self.subprocess_env = os.environ.copy()
         self.enterContext(patch.dict(os.environ, {}, clear=True))
         self.temp = self.enterContext(tempfile.TemporaryDirectory())
         self.env = {
@@ -206,9 +210,11 @@ class SlurmRayTests(unittest.TestCase):
         local_start = Mock()
         ray = SimpleNamespace(init=Mock())
         namespace = {
+            "os": os,
             "_xvla_isolated_ray_kwargs": lambda: {"address": "local"},
             "self": SimpleNamespace(
                 _num_nodes=1,
+                _audited_worker_failure=None,
                 _ray_code_sync_fragment=None,
                 _start_local_ray=local_start,
             ),
@@ -219,6 +225,10 @@ class SlurmRayTests(unittest.TestCase):
         local_start.assert_called_once()
         self.assertEqual(local_start.call_args.args[0]["address"], "local")
         ray.init.assert_not_called()
+        self.assertIsNone(namespace["self"]._audited_worker_failure)
+        with patch.dict(os.environ, {"XVLA_ONLINE_ACCEPTANCE": "1"}):
+            _execute_source_nodes(constructor.body[index : index + 2], namespace)
+        self.assertEqual(namespace["self"]._audited_worker_failure, {})
 
     def test_detached_worker_refuses_auto_connect(self):
         tree = ast.parse(CLUSTER_SOURCE)
@@ -245,7 +255,11 @@ class SlurmRayTests(unittest.TestCase):
         namespace = {
             "os": os,
             "sys": SimpleNamespace(stdout=io.StringIO(), stderr=io.StringIO()),
-            "self": SimpleNamespace(_distributed_log_collector=None, _logger=logger),
+            "self": SimpleNamespace(
+                _audited_worker_failure=None,
+                _distributed_log_collector=None,
+                _logger=logger,
+            ),
             "list_actors": dashboard,
         }
         _execute_source_nodes([method], namespace)
@@ -255,6 +269,82 @@ class SlurmRayTests(unittest.TestCase):
         self.assertEqual(stopped.exception.code, 1)
         dashboard.assert_not_called()
         logger.error.assert_called_once()
+
+    def test_audited_worker_failure_interrupts_once_with_original_cause(self):
+        from rlinf.scheduler.cluster.cluster import Cluster, IsolatedWorkerFailure
+
+        handler = next(
+            node
+            for node in ast.walk(ast.parse(CLUSTER_SOURCE))
+            if isinstance(node, ast.FunctionDef) and node.name == "signal_handler"
+        )
+        cluster = SimpleNamespace(_audited_worker_failure={})
+        namespace = {"self": cluster, "IsolatedWorkerFailure": IsolatedWorkerFailure}
+        _execute_source_nodes([handler], namespace)
+        with (
+            patch.object(signal, "SIGUSR1", 10, create=True),
+            patch.object(os, "kill") as interrupt,
+        ):
+            self.assertTrue(
+                Cluster._interrupt_audited_worker_failure(
+                    cluster, "AuditedEnv", "interact", RuntimeError("no Vulkan device")
+                )
+            )
+            self.assertTrue(
+                Cluster._interrupt_audited_worker_failure(
+                    cluster,
+                    "AuditedRollout",
+                    "generate",
+                    RuntimeError("channel closed"),
+                )
+            )
+        interrupt.assert_called_once_with(os.getpid(), 10)
+        with self.assertRaisesRegex(
+            IsolatedWorkerFailure, "no Vulkan device"
+        ) as raised:
+            namespace["signal_handler"](10, None)
+        self.assertEqual(raised.exception.worker_class, "AuditedEnv")
+        self.assertEqual(raised.exception.method, "interact")
+        self.assertEqual(raised.exception.error_type, "RuntimeError")
+
+    def test_audited_worker_failure_records_reason_before_nonzero_exit(self):
+        folder = Path(self.temp)
+        script = """
+import os
+from pathlib import Path
+from rlinf.scheduler.cluster.cluster import IsolatedWorkerFailure
+from tools.xvla.online_acceptance import _record_failure
+
+folder = Path(os.environ["XVLA_RUN_DIR"])
+try:
+    _record_failure(
+        folder / "online-acceptance.json",
+        IsolatedWorkerFailure("AuditedEnv", "interact", "RuntimeError", "no Vulkan device"),
+        12.0,
+    )
+finally:
+    (folder / "teardown-entered").touch()
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=ROOT,
+            env={**self.subprocess_env, "XVLA_RUN_DIR": str(folder)},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertFalse((folder / "teardown-entered").exists())
+        self.assertTrue((folder / "online-acceptance.json").is_file(), proc.stderr)
+        summary = json.loads((folder / "online-acceptance.json").read_text())
+        event = json.loads(next(folder.glob("audit-*.jsonl")).read_text())
+        self.assertEqual(summary["status"], "FAILED")
+        self.assertEqual(event["event"], "acceptance_failed")
+        for data in (summary, event):
+            self.assertEqual(data["worker_class"], "AuditedEnv")
+            self.assertEqual(data["method"], "interact")
+            self.assertEqual(data["error_type"], "RuntimeError")
+            self.assertEqual(data["error"], "no Vulkan device")
 
 
 class SlurmGPUVisibilityTests(unittest.TestCase):

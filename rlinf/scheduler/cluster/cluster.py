@@ -48,6 +48,19 @@ if TYPE_CHECKING:
     from ..worker import Worker
 
 
+class IsolatedWorkerFailure(RuntimeError):
+    """A remote call failure that interrupts the private X-VLA driver."""
+
+    def __init__(
+        self, worker_class: str, method: str, error_type: str, message: str
+    ) -> None:
+        """Retain the remote call identifier and original exception text."""
+        super().__init__(message)
+        self.worker_class = worker_class
+        self.method = method
+        self.error_type = error_type
+
+
 def _xvla_isolated_ray_kwargs() -> dict[str, Any] | None:
     """Build opt-in Ray resources for Slurm or explicit bounded login debug.
 
@@ -287,6 +300,7 @@ class Cluster:
             return
         self._setup_logger()
         self._distributed_log_collector: Optional[DistributedRayLogCollector] = None
+        self._audited_worker_failure: dict[str, tuple[str, str, str, str]] | None = None
         self._ray_code_sync_fragment: Optional[dict[str, Any]] = None
         self._runtime_code_sync_strip_roots: tuple[str, ...] = ()
         if num_nodes is not None or cluster_cfg is not None:
@@ -434,6 +448,8 @@ class Cluster:
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
             self._start_local_ray(ray_init_kwargs)
+            if os.environ.get("XVLA_ONLINE_ACCEPTANCE") == "1":
+                self._audited_worker_failure = {}
         else:
             try:
                 # First try to connect to an existing Ray cluster
@@ -561,6 +577,8 @@ class Cluster:
 
         def signal_handler(sig, frame):
             # Exit the main process if SIGUSR1 is received, which is sent by the worker group when an exception occurs.
+            if self._audited_worker_failure:
+                raise IsolatedWorkerFailure(*self._audited_worker_failure["first"])
             sys.stdout.flush()
             sys.stderr.flush()
             if self._distributed_log_collector is not None:
@@ -596,6 +614,18 @@ class Cluster:
             exit(-1)
 
         signal.signal(signal.SIGUSR1, signal_handler)
+
+    def _interrupt_audited_worker_failure(
+        self, worker_class: str, method: str, error: Exception
+    ) -> bool:
+        failures = self._audited_worker_failure
+        if failures is None:
+            return False
+        failure = (worker_class, method, type(error).__name__, str(error))
+        # Interrupt the driver once even if several blocked calls fail together.
+        if failures.setdefault("first", failure) is failure:
+            os.kill(os.getpid(), signal.SIGUSR1)
+        return True
 
     def _start_local_ray(self, ray_init_kwargs: dict[str, Any]):
         """Start a local Ray instance, retrying once if the node fails to come up.

@@ -23,6 +23,7 @@ import os
 import random
 import re
 import socket
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -1067,6 +1068,36 @@ def validate_acceptance_cfg(cfg: Any) -> None:
         raise ValueError("acceptance.min_updates must be a positive integer")
 
 
+def _record_failure(destination: Path, error: BaseException, elapsed: float) -> None:
+    from rlinf.scheduler.cluster.cluster import IsolatedWorkerFailure
+
+    private_worker_failure = isinstance(error, IsolatedWorkerFailure)
+    details = {"error_type": type(error).__name__, "error": str(error)}
+    if private_worker_failure:
+        details.update(
+            error_type=error.error_type,
+            worker_class=error.worker_class,
+            method=error.method,
+        )
+    record("acceptance_failed", **details)
+    summary = {
+        "status": "FAILED",
+        "evidence": "real_native_robotwin_rollouts",
+        **details,
+        "elapsed_seconds": elapsed,
+    }
+    with destination.open("w", encoding="utf-8") as stream:
+        stream.write(json.dumps(summary, indent=2, allow_nan=False) + "\n")
+        if private_worker_failure:
+            stream.flush()
+            os.fsync(stream.fileno())
+    if private_worker_failure:
+        # The launcher cleans the private Ray tree without reentering failed RPCs.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
+
+
 def _run(cfg) -> None:
     import ray
     import torch.multiprocessing as mp
@@ -1154,22 +1185,7 @@ def _run(cfg) -> None:
             json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8"
         )
     except BaseException as error:
-        record("acceptance_failed", error_type=type(error).__name__, error=str(error))
-        destination.write_text(
-            json.dumps(
-                {
-                    "status": "FAILED",
-                    "evidence": "real_native_robotwin_rollouts",
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "elapsed_seconds": time.monotonic() - started,
-                },
-                indent=2,
-                allow_nan=False,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        _record_failure(destination, error, time.monotonic() - started)
         raise
     finally:
         ray.shutdown()

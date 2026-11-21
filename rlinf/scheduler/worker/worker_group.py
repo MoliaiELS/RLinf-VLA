@@ -470,7 +470,7 @@ class WorkerGroupFuncResult:
             cls_name (str): The name of the class that the function belongs to.
 
         """
-        self._worker_group: Worker = worker_group
+        self._worker_group = worker_group
         self._remote_results = results
         self._local_results = None
         self._wait_error: Optional[BaseException] = None
@@ -497,6 +497,12 @@ class WorkerGroupFuncResult:
             # result should learn it did not arrive, rather than depending on
             # the signal below reaching the main thread first.
             self._wait_error = e
+            cluster = self._worker_group._cluster
+            if cluster is not None and cluster._interrupt_audited_worker_failure(
+                self._cls_name, self._func_name, e
+            ):
+                self._wait_done = True
+                return
             self._wait_done = True
             # Send suicide signal if one thread failed, the handler is registered in cluster
             os.kill(self._pid, signal.SIGUSR1)
