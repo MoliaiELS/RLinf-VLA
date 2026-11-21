@@ -14,23 +14,36 @@
 
 """Acceptance must distinguish real effective updates from no-signal runs."""
 
+import copy
 import json
+import os
 import random
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
 from tools.xvla.online_acceptance import (
+    capture_rng_state,
     fixed_probe,
+    object_digest,
     parameter_groups,
+    process_identity,
     real_batch_evidence,
     record,
     require_effective_update,
     require_informative_grpo,
     require_matching_states,
+    require_matching_training_states,
+    restore_rng_state,
     state_digest,
     summarize_evidence,
+    training_fingerprints,
+    validate_acceptance_cfg,
 )
 
 
@@ -240,23 +253,49 @@ def test_environment_audit_tracks_actual_rlinf_step_counter():
     assert worker.audit_global_step == 8
 
 
-def complete_events():
-    return [
+def complete_events(updates=1, baseline=0):
+    final = baseline + updates
+    events = []
+    for step in range(baseline + 1, final + 1):
+        events.extend(
+            [
+                {
+                    "event": "training_batch",
+                    "real_environment_steps": 20,
+                    "trajectory_returns": [0.0, 1.0],
+                },
+                {
+                    "event": "optimizer_update",
+                    "status": "PASS",
+                    "optimizer_steps": step,
+                },
+            ]
+        )
+    return events + [
         {
-            "event": "training_batch",
-            "real_environment_steps": 20,
-            "trajectory_returns": [0.0, 1.0],
+            "event": "weight_sync",
+            "status": "PASS",
+            "global_step": final,
+            "optimizer_steps": final,
         },
-        {"event": "optimizer_update", "status": "PASS"},
-        {"event": "weight_sync", "status": "PASS", "global_step": 1},
         {
             "event": "environment_chunk",
             "mode": "eval",
             "executed_actions": 9,
-            "global_step": 1,
+            "global_step": final,
         },
-        {"event": "evaluation_completed", "global_step": 1},
-        {"event": "checkpoint_reload", "status": "PASS", "path": "/native/actor"},
+        {
+            "event": "evaluation_completed",
+            "global_step": final,
+            "optimizer_steps": final,
+        },
+        {
+            "event": "checkpoint_reload",
+            "status": "PASS",
+            "path": "/native/actor",
+            "optimizer_steps": final,
+        },
+        {"event": "worker_checkpoint", "status": "PASS", "optimizer_steps": final},
     ]
 
 
@@ -264,7 +303,7 @@ def test_acceptance_summary_requires_real_post_update_eval_and_native_reload(tmp
     events = complete_events()
     path = tmp_path / "audit-1.jsonl"
     path.write_text("\n".join(json.dumps(event) for event in events))
-    summary = summarize_evidence(tmp_path)
+    summary = summarize_evidence(tmp_path, min_updates=1)
     assert summary["status"] == "PASS"
     assert summary["real_training_environment_steps"] == 20
     assert summary["real_evaluation_environment_steps"] == 9
@@ -272,7 +311,7 @@ def test_acceptance_summary_requires_real_post_update_eval_and_native_reload(tmp
     events[2]["global_step"] = 0
     path.write_text("\n".join(json.dumps(event) for event in events))
     with pytest.raises(RuntimeError, match="updated weights were not synchronized"):
-        summarize_evidence(tmp_path)
+        summarize_evidence(tmp_path, min_updates=1)
 
 
 @pytest.mark.parametrize(
@@ -302,3 +341,242 @@ def test_audit_records_native_tensors_and_numpy_metrics(tmp_path, monkeypatch):
     path = next(tmp_path.glob("audit-*.jsonl"))
     item = json.loads(path.read_text())
     assert item["values"] == {"physics_ticks": [3], "success": 0.0}
+
+
+def test_nested_state_fingerprint_covers_optimizer_rng_and_type():
+    state = {
+        "moments": {0: torch.arange(3.0)},
+        "rng": np.arange(5, dtype=np.uint32),
+        "scheduler": (1, 0.1),
+    }
+    expected = object_digest(state)
+    assert expected == object_digest(dict(reversed(list(state.items()))))
+    changed = copy.deepcopy(state)
+    changed["moments"][0][0] += 1
+    assert expected != object_digest(changed)
+    changed = copy.deepcopy(state)
+    changed["rng"] = changed["rng"].astype(np.int64)
+    assert expected != object_digest(changed)
+    assert object_digest([1, 2]) != object_digest((1, 2))
+
+
+def test_training_fingerprints_detect_real_adam_scheduler_rng_and_counter_changes(
+    monkeypatch,
+):
+    from rlinf.scheduler import Worker
+
+    monkeypatch.setattr(Worker, "torch_platform", None)
+    model = torch.nn.Linear(2, 1)
+    model.register_buffer("frozen", torch.ones(1))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    scheduler.step()
+    states = [
+        copy.deepcopy(model.state_dict()),
+        copy.deepcopy(optimizer.state_dict()),
+        copy.deepcopy(scheduler.state_dict()),
+        capture_rng_state(),
+        1,
+    ]
+    expected = training_fingerprints(*states)
+    require_matching_training_states(expected, training_fingerprints(*states))
+    for name in ("model", "optimizer", "scheduler", "rng", "optimizer_steps"):
+        changed = copy.deepcopy(expected)
+        changed[name] = "different" if name != "optimizer_steps" else 2
+        with pytest.raises(RuntimeError, match=name):
+            require_matching_training_states(expected, changed)
+    before_rng = capture_rng_state()
+    random.random()
+    np.random.rand()
+    torch.rand(1)
+    assert object_digest(before_rng) != object_digest(capture_rng_state())
+    restore_rng_state(before_rng)
+    assert object_digest(before_rng) == object_digest(capture_rng_state())
+
+
+def test_native_dcp_reload_restores_model_optimizer_scheduler_and_rng(
+    tmp_path, monkeypatch
+):
+    from torch.distributed import checkpoint as dcp
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
+    from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
+    from rlinf.scheduler import Worker
+
+    monkeypatch.setattr(Worker, "torch_platform", None)
+    model = torch.nn.Linear(2, 1)
+    model.register_buffer("frozen", torch.ones(1))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.5)
+    model(torch.ones(1, 2)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad()
+    scheduler.step()
+    expected = training_fingerprints(
+        model.state_dict(),
+        optimizer.state_dict(),
+        scheduler.state_dict(),
+        capture_rng_state(),
+        1,
+    )
+    options = StateDictOptions(full_state_dict=False, cpu_offload=True)
+    source = Checkpoint(model, optimizer, scheduler, options, FSDPVersion.FSDP)
+    dcp.save({"fsdp_checkpoint": source}, checkpoint_id=tmp_path / "dcp")
+    restored = torch.nn.Linear(2, 1)
+    restored.register_buffer("frozen", torch.zeros(1))
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.9)
+    restored_scheduler = torch.optim.lr_scheduler.StepLR(restored_optimizer, 5)
+    target = Checkpoint(
+        restored, restored_optimizer, restored_scheduler, options, FSDPVersion.FSDP
+    )
+    dcp.load({"fsdp_checkpoint": target}, checkpoint_id=tmp_path / "dcp")
+    actual = training_fingerprints(
+        restored.state_dict(),
+        restored_optimizer.state_dict(),
+        restored_scheduler.state_dict(),
+        capture_rng_state(),
+        1,
+    )
+    require_matching_training_states(expected, actual)
+    (tmp_path / "metadata.json").write_text(json.dumps(expected))
+    script = textwrap.dedent("""
+        import json, pathlib, sys
+        import torch
+        from torch.distributed import checkpoint as dcp
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+        from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
+        from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
+        from rlinf.scheduler import Worker
+        from tools.xvla.online_acceptance import capture_rng_state, training_fingerprints, process_identity
+        Worker.torch_platform = None
+        folder = pathlib.Path(sys.argv[1])
+        metadata = json.loads((folder / 'metadata.json').read_text())
+        model = torch.nn.Linear(2, 1)
+        model.register_buffer('frozen', torch.zeros(1))
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.9)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 5)
+        target = Checkpoint(model, optimizer, scheduler, StateDictOptions(full_state_dict=False, cpu_offload=True), FSDPVersion.FSDP)
+        dcp.load({'fsdp_checkpoint': target}, checkpoint_id=folder / 'dcp')
+        result = training_fingerprints(model.state_dict(), optimizer.state_dict(), scheduler.state_dict(), capture_rng_state(), metadata['optimizer_steps'])
+        (folder / 'child-state.json').write_text(json.dumps({'fingerprints': result, 'process': process_identity()}))
+    """)
+    environment = os.environ.copy()
+    environment["CUDA_VISIBLE_DEVICES"] = ""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    child = json.loads((tmp_path / "child-state.json").read_text())
+    assert child["process"] != process_identity()
+    require_matching_training_states(expected, child["fingerprints"])
+
+
+def test_zero_update_empty_adam_checkpoint_is_not_synthetically_initialized(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("gymnasium")
+    from tools.xvla.online_acceptance import _worker_classes
+
+    monkeypatch.setenv("XVLA_RUN_DIR", str(tmp_path))
+    actor_type, _, _, _ = _worker_classes()
+    worker = object.__new__(actor_type)
+    worker.optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
+    worker.optimizer_steps = 0
+    worker.save_checkpoint(tmp_path / "actor", 3)
+    assert not worker.optimizer.state
+    assert worker.optimizer_steps == 0
+    event = json.loads(next(tmp_path.glob("audit-*.jsonl")).read_text())
+    assert event["event"] == "checkpoint_skipped"
+    assert event["resumable"] is False
+    assert not (tmp_path / "actor").exists()
+
+
+def test_multiround_acceptance_requires_three_updates_and_accepts_final_skip(tmp_path):
+    path = tmp_path / "audit-1.jsonl"
+    events = complete_events(updates=2)
+    path.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(RuntimeError, match="INSUFFICIENT_EFFECTIVE_UPDATES"):
+        summarize_evidence(tmp_path)
+    events = complete_events(updates=3)
+    events.append({"event": "training_skipped", "status": "PASS", "optimizer_steps": 3})
+    for event in events:
+        if "global_step" in event:
+            event["global_step"] = 4
+    path.write_text("\n".join(json.dumps(event) for event in events))
+    summary = summarize_evidence(tmp_path)
+    assert summary["optimizer_steps"] == 3
+    assert summary["skipped_batches"] == 1
+    [event for event in events if event["event"] == "optimizer_update"][1][
+        "optimizer_steps"
+    ] = 1
+    path.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(RuntimeError, match="not consecutive"):
+        summarize_evidence(tmp_path)
+
+
+def test_fresh_process_resume_requires_state_checks_and_a_new_update(tmp_path):
+    path = tmp_path / "audit-1.jsonl"
+    events = [
+        {
+            "event": "fresh_process_resume",
+            "status": "PASS",
+            "optimizer_steps": 3,
+            "fresh_process": True,
+            "source_process": "old",
+            "destination_process": "new",
+        },
+        {"event": "worker_resume", "status": "PASS", "fresh_process": True},
+    ] + complete_events(updates=1, baseline=3)
+    path.write_text("\n".join(json.dumps(event) for event in events))
+    summary = summarize_evidence(tmp_path, require_resume=True)
+    assert summary["optimizer_updates"] == 1
+    assert summary["optimizer_steps"] == 4
+    assert summary["fresh_process_resume_verified"] is True
+    events[0]["destination_process"] = "old"
+    path.write_text("\n".join(json.dumps(event) for event in events))
+    with pytest.raises(RuntimeError):
+        summarize_evidence(tmp_path, require_resume=True)
+
+
+@pytest.mark.parametrize("algorithm", ["ppo", "grpo"])
+def test_actual_multiround_configs_pass_preflight_without_ray(
+    tmp_path, monkeypatch, algorithm
+):
+    import ray
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    from rlinf.config import validate_xvla_cfg
+
+    for name in ("XVLA_RUN_DIR", "ROBOTWIN_PATH", "XVLA_MODEL_PATH"):
+        monkeypatch.setenv(name, str(tmp_path))
+    was_initialized = ray.is_initialized()
+    root = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    with initialize_config_dir(version_base="1.1", config_dir=str(root)):
+        cfg = compose(config_name=f"robotwin_{algorithm}_xvla_acceptance")
+    validate_acceptance_cfg(cfg)
+    validate_xvla_cfg(cfg)
+    assert cfg.acceptance.min_updates == 3
+    assert cfg.runner.max_epochs == cfg.runner.max_steps >= cfg.acceptance.min_updates
+    assert cfg.runner.val_check_interval == cfg.runner.save_interval == 3
+    assert cfg.actor.fsdp_config.save_full_model_weights is False
+    assert list(cfg.env.train.reset_seeds) == [12000, 12001, 12002, 12003]
+    for key, value, message in (
+        ("runner.weight_sync_interval", 2, "weight_sync_interval=1"),
+        ("runner.overlap_env_bootstrap", True, "episode-boundary"),
+        ("acceptance.min_updates", 0, "positive integer"),
+        ("runner.save_interval", 0, "positive evaluation/checkpoint"),
+    ):
+        invalid = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+        OmegaConf.update(invalid, key, value, force_add=True)
+        with pytest.raises(ValueError, match=message):
+            validate_acceptance_cfg(invalid)
+    assert ray.is_initialized() == was_initialized
