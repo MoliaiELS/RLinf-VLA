@@ -48,6 +48,7 @@ class Submission:
     time_minutes: int = 20
     sampler_diagnostic: bool = False
     config_name: str | None = None
+    after_job: str | None = None
 
     def validate(self) -> None:
         """Reject paths or resources outside the short-test contract."""
@@ -98,6 +99,13 @@ class Submission:
             )
         if re.fullmatch(r"[A-Za-z0-9_.-]+", self.partition) is None:
             raise ValueError("Invalid Slurm partition name")
+        if (
+            self.after_job is not None
+            and re.fullmatch(r"[1-9][0-9]*", self.after_job) is None
+        ):
+            raise ValueError(
+                "--after-job must be one canonical positive numeric Slurm job ID"
+            )
 
 
 @dataclass(frozen=True)
@@ -122,10 +130,24 @@ def parse_queue(text: str) -> list[QueueJob]:
     return jobs
 
 
-def require_submission_capacity(jobs: Sequence[QueueJob]) -> None:
-    """Wait for all running own jobs and preserve the account's two queue slots."""
+def require_submission_capacity(
+    jobs: Sequence[QueueJob], after_job: str | None = None
+) -> None:
+    """Allow no active own job, or only the explicitly named dependency target."""
     active = [job for job in jobs if job.state != "PENDING"]
-    if active:
+    if after_job is not None:
+        if re.fullmatch(r"[1-9][0-9]*", after_job) is None:
+            raise ValueError(
+                "--after-job must be one canonical positive numeric Slurm job ID"
+            )
+        target = [job for job in jobs if job.job_id == after_job]
+        if len(target) != 1:
+            raise RuntimeError(
+                "The dependency target must be present in the own-user queue"
+            )
+        if len(active) != 1 or active[0].job_id != after_job:
+            raise RuntimeError("The dependency target must be the only active own job")
+    elif active:
         found = ", ".join(f"{job.job_id}:{job.state}" for job in active)
         raise RuntimeError(
             f"Wait for current own jobs to end before submitting: {found}"
@@ -163,6 +185,7 @@ def sbatch_command(plan: Submission) -> list[str]:
     command = [
         "sbatch",
         "--parsable",
+        *([f"--dependency=afterany:{plan.after_job}"] if plan.after_job else []),
         f"--partition={plan.partition}",
         "--exclude=4090node1",
         "--nodes=1",
@@ -252,7 +275,7 @@ def submit(plan: Submission) -> dict:
             text=True,
         )
         jobs = parse_queue(own_queue)
-        require_submission_capacity(jobs)
+        require_submission_capacity(jobs, plan.after_job)
         command = sbatch_command(plan)
         result = subprocess.check_output(command, text=True).strip()
         if re.fullmatch(r"[0-9]+(?:;[A-Za-z0-9_.-]+)?", result) is None:
@@ -597,6 +620,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--time-minutes", type=int, default=20)
     parser.add_argument("--sampler-diagnostic", action="store_true")
     parser.add_argument("--config-name")
+    parser.add_argument("--after-job")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 

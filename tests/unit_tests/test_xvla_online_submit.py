@@ -137,6 +137,12 @@ def test_acceptance_config_is_forwarded_without_changing_default_submission(algo
         {"algorithm": "sft"},
         {"config_name": "robotwin_grpo_xvla_acceptance"},
         {"config_name": "arbitrary_training"},
+        {"after_job": "0"},
+        {"after_job": "021038"},
+        {"after_job": "21038_1"},
+        {"after_job": "21038:21039"},
+        {"after_job": "21038;true"},
+        {"after_job": "21038\n"},
     ],
 )
 def test_invalid_paths_or_unbounded_resources_are_rejected(override):
@@ -162,6 +168,37 @@ def test_submission_waits_for_the_current_job_and_keeps_the_held_job():
         require_submission_capacity(parse_queue("20326|PENDING|gpu:unknown\n"))
     with pytest.raises(ValueError, match="Unexpected squeue"):
         parse_queue("20730 RUNNING")
+
+
+def test_dependency_allows_only_the_named_active_own_job_with_existing_resource_bounds():
+    own = parse_queue("21038|RUNNING|gres/gpu:4090:1\n")
+    require_submission_capacity(own, after_job="21038")
+    with pytest.raises(RuntimeError, match="Wait for current"):
+        require_submission_capacity(own)
+    for jobs, message in (
+        ([], "own-user queue"),
+        (parse_queue("21039|RUNNING|gres/gpu:4090:1"), "own-user queue"),
+        (parse_queue("21038|PENDING|gres/gpu:4090:1"), "only active"),
+        (own + parse_queue("21039|RUNNING|gres/gpu:4090:1"), "only active"),
+        (own + parse_queue("21039|PENDING|gres/gpu:4090:1"), "two submitted"),
+        (parse_queue("21038|RUNNING|gres/gpu:4090:2"), "two-own-GPU"),
+        (parse_queue("21038|RUNNING|gpu:unknown"), "Cannot determine"),
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            require_submission_capacity(jobs, after_job="21038")
+    with pytest.raises(ValueError, match="numeric Slurm"):
+        require_submission_capacity(own, after_job="21038:21039")
+
+
+def test_dependency_is_rendered_as_afterany_without_changing_other_resources():
+    config = replace(plan(), algorithm="grpo", cpus=8, time_minutes=30)
+    command = sbatch_command(config)
+    dependency = sbatch_command(replace(config, after_job="21038"))
+    assert dependency == [*command[:2], "--dependency=afterany:21038", *command[2:]]
+    assert dependency[-1] == "robotwin_grpo_xvla_acceptance"
+    assert "--gres=gpu:4090:1" in dependency
+    assert "--cpus-per-task=8" in dependency
+    assert "--time=00:30:00" in dependency
 
 
 def test_scoped_cleanup_keeps_other_users_jobs_and_similar_directory_names():
@@ -638,11 +675,15 @@ def test_login_training_argument_count_and_literal_hydra_forwarding(tmp_path):
 
 @pytest.mark.parametrize("sampler_diagnostic", [False, True])
 @pytest.mark.parametrize("config_name", [None, "robotwin_ppo_xvla_acceptance"])
+@pytest.mark.parametrize("after_job", [None, "21038"])
 def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
-    tmp_path, sampler_diagnostic, config_name
+    tmp_path, sampler_diagnostic, config_name, after_job
 ):
     config = replace(
-        plan(), sampler_diagnostic=sampler_diagnostic, config_name=config_name
+        plan(),
+        sampler_diagnostic=sampler_diagnostic,
+        config_name=config_name,
+        after_job=after_job,
     )
     script = Path(__file__).resolve().parents[2] / "tools/xvla/online_submit.py"
     args = []
@@ -660,6 +701,8 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
         args.append("--sampler-diagnostic")
     if config_name is not None:
         args.extend(("--config-name", config_name))
+    if after_job is not None:
+        args.extend(("--after-job", after_job))
     completed = subprocess.run(
         [sys.executable, str(script), *args, "--dry-run"],
         check=True,
@@ -670,5 +713,6 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
     result = json.loads(completed.stdout)
     assert result["dry_run"] is True
     assert result["plan"]["sampler_diagnostic"] is sampler_diagnostic
+    assert result["plan"]["after_job"] == after_job
     assert result["command"] == sbatch_command(config)
     assert not list(tmp_path.iterdir())
