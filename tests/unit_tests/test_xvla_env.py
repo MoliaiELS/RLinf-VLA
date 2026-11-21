@@ -15,8 +15,9 @@
 """Exercise native X-VLA episodes through RLinf's environment contract."""
 
 import json
+import sys
 import weakref
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -443,3 +444,58 @@ def test_native_task_close_releases_resources_even_when_vendor_close_raises():
     assert episode_type.scene_refs[0]() is None
     task.close()
     assert episode_type.closed == [False]
+
+
+def test_training_renderer_and_scene_share_the_explicit_vulkan_device(monkeypatch):
+    from tools.xvla.robotwin.bind_renderer import bind_renderer
+
+    class NativeRenderer:
+        def __init__(self, device=None):
+            self.device = device
+
+    class LegacyRenderer(NativeRenderer):
+        def __init__(self, **kwargs):
+            super().__init__()
+
+        def create_material(self):
+            return "legacy material"
+
+    class Engine:
+        def create_scene(self, config=None):
+            raise AssertionError("The default scene would use an unbound GPU")
+
+    core = ModuleType("sapien.core")
+    core.Engine = Engine
+    core.SapienRenderer = LegacyRenderer
+    core.SceneConfig = object
+    sapien = ModuleType("sapien")
+    sapien.core = core
+    sapien.SapienRenderer = LegacyRenderer
+    sapien.Device = lambda alias: SimpleNamespace(alias=alias)
+    sapien.Scene = tuple
+    sapien.physx = SimpleNamespace(
+        PhysxCpuSystem=object, set_scene_config=lambda config: None
+    )
+    sapien.render = SimpleNamespace(
+        RenderSystem=lambda device: SimpleNamespace(device=device)
+    )
+    sapien.pysapien = SimpleNamespace(
+        render=SimpleNamespace(SapienRenderer=NativeRenderer)
+    )
+    monkeypatch.setitem(sys.modules, "sapien", sapien)
+    monkeypatch.setitem(sys.modules, "sapien.core", core)
+    monkeypatch.setenv("FYP_ROBOTWIN_VULKAN_DEVICE", "pci:49:00.0")
+
+    bind_renderer()
+    scene = Engine().create_scene()
+    assert LegacyRenderer().device is None
+    bind_renderer(pin_legacy_renderer=True)
+    renderer = core.SapienRenderer(device="cuda:0")
+    assert type(renderer) is sapien.SapienRenderer
+    assert renderer.create_material() == "legacy material"
+    assert renderer.device is scene[1].device
+    assert renderer.device.alias == "pci:49:00.0"
+    init = LegacyRenderer.__init__
+    bind_renderer(pin_legacy_renderer=True)
+    assert LegacyRenderer.__init__ is init
+    assert Engine().create_scene()[1].device is renderer.device

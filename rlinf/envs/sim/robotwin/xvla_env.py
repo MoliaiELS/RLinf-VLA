@@ -32,9 +32,11 @@ class NativeTask:
 
     def __init__(self, cfg):
         from tools.xvla.robotwin import runner
+        from tools.xvla.robotwin.bind_renderer import bind_renderer
 
         root = Path(cfg.robotwin_root).resolve()
         runner.pinned_checkout(root, protocol.ROBOTWIN_COMMIT)
+        bind_renderer(pin_legacy_renderer=True)
         self.module, task_type, self.config, _ = runner.load_native(
             root, cfg.task_name, cfg.condition
         )
