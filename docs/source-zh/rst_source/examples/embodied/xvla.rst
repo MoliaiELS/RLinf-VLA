@@ -203,6 +203,8 @@ checkpoint 目录包含 ``actor/dcp_checkpoint`` 及配套审计 sidecar，包�
 
 policy 缓存完整且 detached 的 20D 去噪链，并在更新时用同一批状态重算联合 log-probability，对去噪时间、预测 horizon 和 raw 坐标求和。这是扩展采样路径的密度，包含不影响最终执行前缀的 latent；不把它称为阈值化夹爪命令的密度。
 
+rollout 和 actor 重算均逐样本计算观测与去噪路径，每次 batch size 为一，与环境组大小和 actor microbatch size 分开。这使首次更新前模型和 noise head 使用一致的计算形状。Gaussian score 运算使用 float64，联合标量再转换为 float32，以兼容原生 RLinf loss。更新前联合 log-probability 检查仍保留 0.01 的绝对误差阈值。
+
 RLinf 通过 ``[B,C,1]`` 的首个动作槽位接收联合标量，其余槽位置零。保持 ``logprob_action_dim=1`` 和 ``logprob_type=chunk_level``，确保该标量只求和一次。整块未执行时全部 mask；执行中提前终止时，已经采样的完整路径仍进入 likelihood。
 
 每个 chunk 的奖励为原生逐 anchor 奖励之和；PPO 的 ``gamma=0.99`` 按完整 chunk 折扣，300-anchor horizon 作为有限回合上限。actor 和 critic 的 loss 归一化也按 chunk 计数：最后一块即使只执行部分 anchor，仍计一个有效宏步，与完整执行的 chunk 一致。回合上限向上取整为 chunk 数，300 个 anchor、chunk size 为 30 时共 10 个宏步。真实控制步仍由 ``executed_mask`` 计数，与宏步分开记录。

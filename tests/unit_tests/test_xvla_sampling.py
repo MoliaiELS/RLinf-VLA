@@ -49,10 +49,25 @@ class AffineClean(nn.Module):
 
 def _independent_logprob(value, mean, std):
     return (
-        torch.distributions.Normal(mean, std)
-        .log_prob(value)
+        torch.distributions.Normal(mean.double(), std.double())
+        .log_prob(value.double())
         .sum(dim=(-2, -1), dtype=torch.float64)
     )
+
+
+def test_full_path_density_preserves_small_mean_changes_at_native_scales():
+    sampler = FlowSampler(steps=10, action_dim=20, noise_std=[0.003] * 20)
+    predictor = AffineClean(bias=0.2)
+    z = torch.zeros(1, 30, 20)
+    sampled = sampler.sample(
+        predictor, z, torch.zeros(1, 20), generator=torch.Generator().manual_seed(17)
+    )
+    before = sampler.recompute(predictor, sampled["chains"], torch.zeros(1, 20))
+    with torch.no_grad():
+        predictor.bias.add_(1e-7)
+    after = sampler.recompute(predictor, sampled["chains"], torch.zeros(1, 20))
+    assert before["logprobs"].dtype == after["logprobs"].dtype == torch.float64
+    assert 0 < (after["logprobs"] - before["logprobs"]).abs().item() < 0.01
 
 
 def test_single_transition_density_and_clean_mean_score_match_analytic_gaussian():

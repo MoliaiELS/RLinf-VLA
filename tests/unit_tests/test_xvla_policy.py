@@ -115,6 +115,154 @@ def observation():
     }
 
 
+class ImageVendorProcessor:
+    tokenizer = SimpleNamespace(pad_token_id=17)
+
+    def __call__(self, images, text):
+        pixels = torch.stack(
+            [torch.from_numpy(np.array(image)).permute(2, 0, 1) for image in images]
+        )
+        return {
+            "input_ids": torch.arange(1, len(text.split()) + 1)[None],
+            "image_input": pixels[None].float() / 255,
+            "image_mask": torch.ones(1, 3, dtype=torch.bool),
+        }
+
+
+def unequal_observation():
+    return {
+        "main_images": torch.arange(4, dtype=torch.uint8)[:, None, None, None]
+        .expand(4, 4, 4, 3)
+        .mul(31),
+        "wrist_images": torch.arange(8, dtype=torch.uint8)
+        .reshape(4, 2, 1, 1, 1)
+        .expand(4, 2, 4, 4, 3)
+        .mul(23),
+        "states": torch.linspace(-0.7, 0.9, 80).reshape(4, 20),
+        "task_descriptions": ["a", "a b", "a b c", "a b c d"],
+    }
+
+
+def recorded_policy():
+    model = make_policy()
+    model.processor = ImageVendorProcessor()
+    calls = {name: [] for name in ("encoder", "predictor", "noise", "value")}
+    forward_vlm = model.core.forward_vlm
+
+    def encode(ids, images, mask):
+        calls["encoder"].append(tuple(ids.shape))
+        return forward_vlm(ids, images, mask)
+
+    model.core.forward_vlm = encode
+    model.core.transformer.register_forward_pre_hook(
+        lambda module, args, kwargs: calls["predictor"].append(
+            kwargs["action_with_noise"].shape[0]
+        ),
+        with_kwargs=True,
+    )
+    model.sampler.noise_head.register_forward_pre_hook(
+        lambda module, args: calls["noise"].append(args[0].shape[0])
+    )
+    model.value_head.register_forward_pre_hook(
+        lambda module, args: calls["value"].append(args[0].shape[0])
+    )
+    return model, calls
+
+
+def test_rollout_preserves_full_initial_noise_draw_and_processes_samples_independently():
+    model, calls = recorded_policy()
+    torch.manual_seed(715)
+    expected_initial = torch.randn(4, 30, 20)
+    torch.manual_seed(715)
+    _, rollout = model.predict_action_batch(unequal_observation(), mode="train")
+    cache = rollout["forward_inputs"]
+    torch.testing.assert_close(cache["chains"][:, 0], expected_initial, rtol=0, atol=0)
+    assert cache["input_ids"].tolist() == [
+        [1, 17, 17, 17],
+        [1, 2, 17, 17],
+        [1, 2, 3, 17],
+        [1, 2, 3, 4],
+    ]
+    assert calls["encoder"] == [(1, 4)] * 4
+    assert calls["predictor"] == [1] * (4 * model.steps)
+    assert calls["noise"] == [1] * (4 * model.steps)
+    assert calls["value"] == [1] * 4
+    assert rollout["prev_logprobs"].dtype == torch.float32
+
+
+@pytest.mark.parametrize("partition", [(1, 1, 1, 1), (2, 2), (3, 1)])
+def test_cached_batch_replay_is_invariant_to_permuted_actor_partitions(partition):
+    model, _ = recorded_policy()
+    initial = torch.linspace(-1.1, 1.3, 4 * 30 * 20).reshape(4, 30, 20)
+    torch.manual_seed(716)
+    _, rollout = model.predict_action_batch(
+        unequal_observation(), mode="train", initial_noise=initial
+    )
+    cache = rollout["forward_inputs"]
+    cache["executed_mask"] = (
+        torch.arange(30)[None] < torch.tensor([30, 11, 1, 0])[:, None]
+    )
+    expected = model.default_forward(cache, compute_values=True, compute_entropy=True)
+    torch.testing.assert_close(
+        expected["logprobs"][:3], rollout["prev_logprobs"][:3], rtol=0, atol=0
+    )
+    assert expected["logprobs"][3].count_nonzero() == 0
+    weights = torch.tensor([0.7, -0.3, 1.1, -0.8])
+
+    def objective(output):
+        return (
+            (output["logprobs"].flatten(1).sum(1) * weights).sum()
+            + 0.2 * output["values"].square().sum()
+            - 0.01 * output["entropy"].sum()
+        )
+
+    objective(expected).backward()
+    reference_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+    for name in (
+        "core.transformer.theta",
+        "sampler.noise_head.net.2.weight",
+        "value_head.2.weight",
+    ):
+        assert torch.isfinite(reference_gradients[name]).all()
+        assert reference_gradients[name].norm() > 0
+
+    replay, calls = recorded_policy()
+    replay.load_state_dict(model.state_dict(), strict=True)
+    order = torch.tensor([2, 0, 3, 1])
+    outputs = []
+    start = 0
+    for count in partition:
+        ids = order[start : start + count]
+        inputs = {name: value[ids] for name, value in cache.items()}
+        outputs.append(
+            replay.default_forward(inputs, compute_values=True, compute_entropy=True)
+        )
+        start += count
+    inverse = order.argsort()
+    actual = {
+        name: torch.cat([output[name] for output in outputs])[inverse]
+        for name in ("logprobs", "values", "entropy")
+    }
+    for name in actual:
+        torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    objective(actual).backward()
+    for name, parameter in replay.named_parameters():
+        if name in reference_gradients:
+            assert parameter.grad is not None
+            torch.testing.assert_close(
+                parameter.grad, reference_gradients[name], rtol=2e-5, atol=2e-5
+            )
+    assert calls["encoder"] == [(1, 4)] * 4
+    assert calls["predictor"] == [1] * (4 * replay.steps)
+    assert calls["noise"] == [1] * (4 * replay.steps)
+    assert calls["value"] == [1] * 4
+    assert actual["logprobs"].dtype == torch.float32
+
+
 def test_rollout_recompute_full_path_and_prefix_mask():
     model = make_policy()
     actions, rollout = model.predict_action_batch(observation(), mode="train")

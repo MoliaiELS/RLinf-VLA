@@ -256,6 +256,11 @@ class XVLAPolicy(nn.Module, BasePolicy):
             inputs["input_ids"], inputs["image_input"], inputs["image_mask"]
         )
 
+    @staticmethod
+    def _single_inputs(inputs: dict, index: int) -> dict:
+        # Keep the original batch's token padding in the cached actor inputs.
+        return {key: inputs[key][index : index + 1] for key in INPUT_KEYS}
+
     def _predictor(self, inputs: dict, encoded: dict):
         def predict(noisy, time):
             proprio, action = self.core.action_space.preprocess(
@@ -302,7 +307,6 @@ class XVLAPolicy(nn.Module, BasePolicy):
                 "RL deployment evaluation uses the matching flow_ode sampler"
             )
         inputs = self._inputs(env_obs)
-        encoded = self._encode(inputs)
         parameter = inputs["proprio"]
         initial_noise = kwargs.get("initial_noise")
         if initial_noise is None:
@@ -311,13 +315,32 @@ class XVLAPolicy(nn.Module, BasePolicy):
                 device=parameter.device,
                 dtype=parameter.dtype,
             )
-        sampled = self.sampler.sample(
-            self._predictor(inputs, encoded),
-            initial_noise,
-            parameter,
-            context=self._context(encoded),
-            deterministic=mode == "eval",
-        )
+        if (
+            not len(parameter)
+            or initial_noise.ndim < 1
+            or initial_noise.shape[0] != len(parameter)
+        ):
+            raise ValueError("Expected one initial-noise trajectory per observation")
+        samples, values = [], []
+        # Tiny batch-dependent FP32 prediction changes amplify in the full-path
+        # density. Match the actor's per-sample scoring kernels during rollout.
+        for index in range(len(parameter)):
+            single = self._single_inputs(inputs, index)
+            encoded = self._encode(single)
+            samples.append(
+                self.sampler.sample(
+                    self._predictor(single, encoded),
+                    initial_noise[index : index + 1],
+                    single["proprio"],
+                    context=self._context(encoded),
+                    deterministic=mode == "eval",
+                )
+            )
+            values.append(self._values(encoded, single, compute_values))
+        sampled = {
+            key: torch.cat([sample[key] for sample in samples], dim=0)
+            for key in samples[0]
+        }
         raw = sampled["actions"][:, : self.num_action_chunks].detach()
         actions = self.core.action_space.postprocess(raw.clone()).float().cpu().numpy()
         cache = {key: value.detach().clone() for key, value in inputs.items()}
@@ -330,7 +353,7 @@ class XVLAPolicy(nn.Module, BasePolicy):
             "prev_logprobs": pack_joint_logprob(
                 sampled["logprobs"], self.num_action_chunks
             ),
-            "prev_values": self._values(encoded, inputs, compute_values)[:, None],
+            "prev_values": torch.cat(values)[:, None],
             "forward_inputs": cache,
         }
 
@@ -350,13 +373,30 @@ class XVLAPolicy(nn.Module, BasePolicy):
         if not compute_logprobs:
             raise ValueError("On-policy X-VLA forward must recompute the path density")
         inputs = self._device_inputs(forward_inputs)
-        encoded = self._encode(inputs)
-        stats = self.sampler.recompute(
-            self._predictor(inputs, encoded),
-            forward_inputs["chains"],
-            inputs["proprio"],
-            context=self._context(encoded),
-        )
+        chains = forward_inputs["chains"]
+        if (
+            not len(inputs["proprio"])
+            or chains.ndim < 1
+            or chains.shape[0] != len(inputs["proprio"])
+        ):
+            raise ValueError("Expected one cached trajectory per observation")
+        samples, values = [], []
+        for index in range(len(inputs["proprio"])):
+            single = self._single_inputs(inputs, index)
+            encoded = self._encode(single)
+            samples.append(
+                self.sampler.recompute(
+                    self._predictor(single, encoded),
+                    chains[index : index + 1],
+                    single["proprio"],
+                    context=self._context(encoded),
+                )
+            )
+            values.append(self._values(encoded, single, compute_values))
+        stats = {
+            key: torch.cat([sample[key] for sample in samples], dim=0)
+            for key in samples[0]
+        }
         logprobs = pack_joint_logprob(stats["logprobs"], self.num_action_chunks)
         entropy = pack_joint_logprob(stats["entropy"], self.num_action_chunks)
         mask = forward_inputs.get("executed_mask")
@@ -369,6 +409,6 @@ class XVLAPolicy(nn.Module, BasePolicy):
             entropy = torch.where(mask[..., None].bool(), entropy, 0.0)
         return {
             "logprobs": logprobs,
-            "values": self._values(encoded, inputs, compute_values),
+            "values": torch.cat(values),
             "entropy": entropy if compute_entropy else None,
         }

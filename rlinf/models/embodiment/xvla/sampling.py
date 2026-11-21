@@ -26,6 +26,7 @@ CleanPredictor = Callable[[Tensor, Tensor], Tensor]
 
 
 def _normal_logprob(sample: Tensor, mean: Tensor, std: Tensor) -> Tensor:
+    sample, mean, std = sample.double(), mean.double(), std.double()
     return (
         -0.5 * ((sample - mean) / std).square()
         - std.log()
@@ -34,6 +35,7 @@ def _normal_logprob(sample: Tensor, mean: Tensor, std: Tensor) -> Tensor:
 
 
 def _normal_entropy(std: Tensor) -> Tensor:
+    std = std.double()
     return (std.log() + 0.5 * math.log(2.0 * math.pi * math.e)).sum(
         dim=(-2, -1), dtype=torch.float64
     )

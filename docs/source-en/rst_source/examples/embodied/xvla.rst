@@ -282,6 +282,13 @@ prediction horizon, and raw coordinates. This is the density of an augmented
 sample path, including latent variables that do not affect the final executed
 prefix; it is not a claimed density for thresholded gripper commands.
 
+Rollout and actor recomputation evaluate each observation and denoising path
+with a batch size of one, independently of the environment group or actor
+microbatch size. This keeps model and noise-head kernel shapes consistent
+before the first update. Gaussian score arithmetic uses float64 before the
+joint scalar is converted to float32 for the native RLinf loss contract.
+The pre-update joint log-probability check retains its 0.01 absolute tolerance.
+
 RLinf receives that joint scalar in the first action slot of ``[B,C,1]``;
 the remaining slots are zero. Keep ``logprob_action_dim=1`` and
 ``logprob_type=chunk_level`` so the scalar is summed once. An entirely
