@@ -181,7 +181,7 @@ jobs:
               - *shared
               - 'rlinf/models/embodiment/xvla/**'
               - 'xvla_rlinf/**'
-              - 'examples/embodiment/config/*xvla.yaml'
+              - 'examples/embodiment/config/*xvla*.yaml'
               - 'examples/embodiment/config/model/xvla.yaml'
               - 'rlinf/robotics/**'
               # Unit tests import env modules directly (robot task envs, the

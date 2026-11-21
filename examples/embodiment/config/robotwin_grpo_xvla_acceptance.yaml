@@ -1,0 +1,23 @@
+# Tied groups remain skips; three effective updates are required for acceptance.
+defaults:
+  - robotwin_grpo_xvla
+  - _self_
+
+runner:
+  max_epochs: 3
+  max_steps: 3
+  val_check_interval: 3
+  save_interval: 3
+  logger:
+    experiment_name: robotwin_grpo_xvla_acceptance
+
+acceptance:
+  min_updates: 3
+
+env:
+  train:
+    reset_seed_mode: cycle
+
+actor:
+  fsdp_config:
+    save_full_model_weights: false

@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
 
 def _xvla_isolated_ray_kwargs() -> dict[str, Any] | None:
-    """Build an opt-in Ray configuration bounded by this Slurm allocation.
+    """Build opt-in Ray resources for Slurm or explicit bounded login debug.
 
     Returns:
         The local Ray arguments, or None when isolation is disabled.
@@ -63,16 +63,45 @@ def _xvla_isolated_ray_kwargs() -> dict[str, Any] | None:
     import json
 
     job_id = os.environ.get("SLURM_JOB_ID")
-    if not job_id:
+    login_debug = os.environ.get("XVLA_LOGIN_TRAINING_DEBUG") == "1"
+    if login_debug:
+        import hashlib
+        import socket
+
+        if "SLURM_JOB_ID" in os.environ or socket.gethostname() != "4090node1":
+            raise RuntimeError("Login training debug requires 4090node1 outside Slurm")
+        job_id = os.environ.get("XVLA_LOGIN_RUN_ID", "")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", job_id) is None:
+            raise ValueError("Set an 8-64 character private XVLA_LOGIN_RUN_ID")
+        seconds = int(os.environ.get("XVLA_LOGIN_SECONDS", "0"))
+        if not 30 <= seconds < 1500:
+            raise ValueError("Login training debug requires a timeout below 25 minutes")
+        allocated_cpus = int(os.environ.get("XVLA_LOGIN_CPUS", "0"))
+        if allocated_cpus != 4:
+            raise ValueError(
+                "Login training debug requires an explicit four-CPU budget"
+            )
+    elif not job_id:
         raise RuntimeError("Isolated X-VLA Ray requires a Slurm allocation")
-    allocated_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    else:
+        allocated_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
     requested_cpus = int(os.environ.get("RLINF_XVLA_RAY_CPUS", str(allocated_cpus)))
     if not 1 <= requested_cpus <= allocated_cpus:
-        raise ValueError("Ray CPUs must be positive and bounded by SLURM_CPUS_PER_TASK")
+        raise ValueError(
+            "Ray CPUs must be positive and bounded by the execution budget"
+        )
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     gpu_ids = [item.strip() for item in visible.split(",") if item.strip()]
     if any(item in {"-1", "NoDevFiles"} for item in gpu_ids):
         gpu_ids = []
+    if login_debug and (
+        len(gpu_ids) != 1
+        or re.fullmatch(
+            r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", gpu_ids[0]
+        )
+        is None
+    ):
+        raise ValueError("Login training debug requires one explicit GPU UUID")
     store_bytes = int(
         os.environ.get("RLINF_XVLA_RAY_OBJECT_STORE_BYTES", str(2 * 1024**3))
     )
@@ -86,9 +115,14 @@ def _xvla_isolated_ray_kwargs() -> dict[str, Any] | None:
         raise RuntimeError("Set job-private RAY_TMPDIR and FYP_XVLA_RAY_SPILL")
     temp_dir, spill_dir = Path(temp_value), Path(spill_value)
     for label, directory in (("Ray temp", temp_dir), ("Ray spill", spill_dir)):
-        if not directory.is_absolute() or job_id not in str(directory):
+        identity = (
+            hashlib.sha256(job_id.encode()).hexdigest()[:16]
+            if login_debug and label == "Ray temp"
+            else job_id
+        )
+        if not directory.is_absolute() or identity not in str(directory):
             raise ValueError(
-                f"{label} path must be absolute and contain the Slurm job ID"
+                f"{label} path must be absolute and contain the job or debug run ID"
             )
         directory.mkdir(parents=True, exist_ok=True)
     return {

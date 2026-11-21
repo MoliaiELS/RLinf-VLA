@@ -13,7 +13,9 @@ model_path="${5:?verified model directory}"
 algorithm="${6:?ppo or grpo}"
 minutes="${7:?Slurm wall-time minutes}"
 commit="${8:?fixed complete Git commit}"
+config="${9:-robotwin_${algorithm}_xvla}"
 [[ "$algorithm" == ppo || "$algorithm" == grpo ]]
+[[ "$config" == "robotwin_${algorithm}_xvla" || "$config" == "robotwin_${algorithm}_xvla_acceptance" ]]
 [[ "$minutes" =~ ^[0-9]+$ && "$minutes" -ge 1 && "$minutes" -le 30 ]]
 [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
 [[ "$output_root" = /* && "$output_root" != / ]]
@@ -79,4 +81,4 @@ trap 'exit 130' INT
 seconds=$((minutes * 60 - 60))
 if (( seconds < 30 )); then seconds=30; fi
 cd "$repo"
-timeout --signal=TERM --kill-after=15s "${seconds}s" bash tools/xvla/train.sh "robotwin_${algorithm}_xvla" "runner.logger.log_path=$XVLA_RUN_DIR"
+timeout --signal=TERM --kill-after=15s "${seconds}s" bash tools/xvla/train.sh "$config" "runner.logger.log_path=$XVLA_RUN_DIR"

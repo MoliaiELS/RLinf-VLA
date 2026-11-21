@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import io
 import json
 import logging
 import os
+import re
 import tempfile
 import unittest
 import warnings
@@ -74,7 +76,7 @@ class SlurmRayTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "_xvla_isolated_ray_kwargs"
         ]
-        namespace = {"os": os, "Path": Path}
+        namespace = {"os": os, "re": re, "Path": Path}
         _execute_source_nodes(nodes, namespace)
         self.kwargs = namespace["_xvla_isolated_ray_kwargs"]
 
@@ -99,6 +101,74 @@ class SlurmRayTests(unittest.TestCase):
             with self.subTest(missing=missing), patch.dict(os.environ, env, clear=True):
                 with self.assertRaises(RuntimeError):
                     self.kwargs()
+
+    def login_env(self):
+        run_id = "login_test_12345"
+        return {
+            key: value
+            for key, value in self.env.items()
+            if not key.startswith("SLURM_")
+        } | {
+            "XVLA_LOGIN_TRAINING_DEBUG": "1",
+            "XVLA_LOGIN_RUN_ID": run_id,
+            "XVLA_LOGIN_CPUS": "4",
+            "XVLA_LOGIN_SECONDS": "1200",
+            "CUDA_VISIBLE_DEVICES": "GPU-16767e50-647f-d107-5073-8b2a27f3773a",
+            "RAY_TMPDIR": str(
+                Path(self.temp) / hashlib.sha256(run_id.encode()).hexdigest()[:16]
+            ),
+            "FYP_XVLA_RAY_SPILL": str(Path(self.temp) / f"spill_{run_id}"),
+        }
+
+    def test_login_debug_has_its_own_identity_without_fabricating_slurm(self):
+        env = self.login_env()
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch("socket.gethostname", return_value="4090node1"),
+        ):
+            actual = self.kwargs()
+            self.assertEqual(dict(os.environ), env)
+        self.assertEqual(actual["address"], "local")
+        self.assertEqual(actual["num_cpus"], 4)
+        self.assertEqual(actual["num_gpus"], 1)
+        self.assertEqual(actual["object_store_memory"], 2 * 1024**3)
+        self.assertFalse(actual["include_dashboard"])
+        for seconds in ("30", "1440", "1499"):
+            with (
+                patch.dict(
+                    os.environ, env | {"XVLA_LOGIN_SECONDS": seconds}, clear=True
+                ),
+                patch("socket.gethostname", return_value="4090node1"),
+            ):
+                self.assertEqual(self.kwargs()["num_cpus"], 4)
+
+    def test_login_debug_rejects_unbounded_or_ambiguous_context(self):
+        invalid = [
+            {"XVLA_LOGIN_TRAINING_DEBUG": "0"},
+            {"SLURM_JOB_ID": "12345"},
+            {"XVLA_LOGIN_RUN_ID": "../other"},
+            {"XVLA_LOGIN_SECONDS": "0"},
+            {"XVLA_LOGIN_SECONDS": "1500"},
+            {"XVLA_LOGIN_CPUS": "8"},
+            {"RLINF_XVLA_RAY_CPUS": "5"},
+            {"CUDA_VISIBLE_DEVICES": "0,1"},
+            {"CUDA_VISIBLE_DEVICES": "0"},
+            {"RAY_TMPDIR": str(Path(self.temp) / "other_run")},
+        ]
+        for override in invalid:
+            with (
+                self.subTest(override=override),
+                patch.dict(os.environ, self.login_env() | override, clear=True),
+                patch("socket.gethostname", return_value="4090node1"),
+            ):
+                with self.assertRaises((ValueError, RuntimeError)):
+                    self.kwargs()
+        with (
+            patch.dict(os.environ, self.login_env(), clear=True),
+            patch("socket.gethostname", return_value="4090node2"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.kwargs()
 
     def test_cpu_object_store_and_job_path_bounds_are_enforced(self):
         invalid = [

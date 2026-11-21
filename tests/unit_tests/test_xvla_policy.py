@@ -279,7 +279,12 @@ def test_builtin_registration_and_config_contracts(monkeypatch, tmp_path):
         monkeypatch.setenv(key, str(tmp_path))
     config_root = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
     with initialize_config_dir(version_base="1.1", config_dir=str(config_root)):
-        for config_name in ("robotwin_ppo_xvla", "robotwin_grpo_xvla"):
+        for config_name in (
+            "robotwin_ppo_xvla",
+            "robotwin_grpo_xvla",
+            "robotwin_ppo_xvla_acceptance",
+            "robotwin_grpo_xvla_acceptance",
+        ):
             cfg = compose(config_name=config_name)
             validate_xvla_cfg(cfg)
             cfg.actor.model.logprob_action_dim = 20

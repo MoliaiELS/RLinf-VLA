@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${SLURM_JOB_ID:?Run X-VLA training inside an allocated Slurm job}"
-: "${CUDA_VISIBLE_DEVICES:?Slurm GPU allocation mask is required}"
-: "${SLURM_CPUS_PER_TASK:?Slurm CPU allocation is required}"
+: "${CUDA_VISIBLE_DEVICES:?A single allocated or explicitly selected GPU is required}"
+if [[ "${XVLA_LOGIN_TRAINING_DEBUG:-0}" == 1 ]]; then
+    [[ "$(hostname)" == 4090node1 && ! -v SLURM_JOB_ID ]]
+    [[ "${XVLA_LOGIN_RUN_ID:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{7,63}$ ]]
+    [[ "${XVLA_LOGIN_CPUS:-}" == 4 ]]
+    [[ "${XVLA_LOGIN_SECONDS:-}" =~ ^[1-9][0-9]{1,3}$ && "$XVLA_LOGIN_SECONDS" -ge 30 && "$XVLA_LOGIN_SECONDS" -lt 1500 ]]
+    run_id="login_${XVLA_LOGIN_RUN_ID}"
+else
+    : "${SLURM_JOB_ID:?Run X-VLA training inside an allocated Slurm job}"
+    : "${SLURM_CPUS_PER_TASK:?Slurm CPU allocation is required}"
+    run_id="$SLURM_JOB_ID"
+fi
 : "${ROBOTWIN_PATH:?Set the pinned native RoboTwin checkout}"
 : "${XVLA_MODEL_PATH:?Set the verified pinned X-VLA RoboTwin model directory}"
 : "${XVLA_RUN_DIR:?Set a new personal-storage output directory}"
 config="${1:?Choose robotwin_ppo_xvla or robotwin_grpo_xvla}"
 shift
 case "$config" in
-    robotwin_ppo_xvla|robotwin_grpo_xvla) ;;
+    robotwin_ppo_xvla|robotwin_grpo_xvla|robotwin_ppo_xvla_acceptance|robotwin_grpo_xvla_acceptance) ;;
     *) echo "Unsupported X-VLA training config: $config" >&2; exit 2 ;;
 esac
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -28,8 +37,14 @@ export PYTHONPATH="$repo${PYTHONPATH:+:$PYTHONPATH}"
 export RLINF_XVLA_ISOLATED_RAY=1
 export RLINF_XVLA_ALLOCATION_CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES"
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
-export RAY_TMPDIR="/tmp/xvla_rl_${USER}_${SLURM_JOB_ID}"
-export FYP_XVLA_RAY_SPILL="$XVLA_RUN_DIR/ray-spill"
+if [[ "${XVLA_LOGIN_TRAINING_DEBUG:-0}" == 1 ]]; then
+    RAY_TMPDIR="$(python -c 'from tools.xvla.online_submit import private_ray_marker; print(private_ray_marker())')"
+    export RAY_TMPDIR
+    export FYP_XVLA_RAY_SPILL="$XVLA_RUN_DIR/ray-spill-${XVLA_LOGIN_RUN_ID}"
+else
+    export RAY_TMPDIR="/tmp/xvla_rl_${USER}_${run_id}"
+    export FYP_XVLA_RAY_SPILL="$XVLA_RUN_DIR/ray-spill"
+fi
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 export USE_TF=0 USE_TORCH=1
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONUNBUFFERED=1
@@ -54,8 +69,11 @@ modules = {name: getattr(importlib.util.find_spec(name), 'origin', None)
 receipt = dict(commit=subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip(),
                python=sys.executable, imports=modules, torch=torch.__version__,
                cuda_visible_devices=os.environ['CUDA_VISIBLE_DEVICES'],
-               slurm_job_id=os.environ['SLURM_JOB_ID'],
-               slurm_cpus=os.environ['SLURM_CPUS_PER_TASK'])
+               slurm_job_id=os.environ.get('SLURM_JOB_ID'),
+               slurm_cpus=os.environ.get('SLURM_CPUS_PER_TASK'),
+               login_training_debug=os.environ.get('XVLA_LOGIN_TRAINING_DEBUG') == '1',
+               login_run_id=os.environ.get('XVLA_LOGIN_RUN_ID'),
+               login_cpus=os.environ.get('XVLA_LOGIN_CPUS'))
 if torch.cuda.device_count() != 1:
     raise RuntimeError('The initial X-VLA training configuration requires exactly one allocated GPU')
 properties = torch.cuda.get_device_properties(0)

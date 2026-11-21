@@ -47,6 +47,7 @@ class Submission:
     cpus: int = 8
     time_minutes: int = 20
     sampler_diagnostic: bool = False
+    config_name: str | None = None
 
     def validate(self) -> None:
         """Reject paths or resources outside the short-test contract."""
@@ -80,6 +81,13 @@ class Submission:
                 )
         if self.algorithm not in {"ppo", "grpo"}:
             raise ValueError("The online acceptance algorithm must be ppo or grpo")
+        if self.config_name is not None and self.config_name not in {
+            f"robotwin_{self.algorithm}_xvla",
+            f"robotwin_{self.algorithm}_xvla_acceptance",
+        }:
+            raise ValueError(
+                "The config name must select the requested X-VLA algorithm"
+            )
         if self.gpu not in {"4090", "3090"}:
             raise ValueError("The short test requires one known 4090 or 3090 GPU")
         if self.cpus not in {8, 16}:
@@ -152,7 +160,7 @@ def sbatch_command(plan: Submission) -> list[str]:
         else f"xvla-online-{plan.algorithm}"
     )
     exported = "ALL,XVLA_SAMPLER_DIAGNOSTIC=1" if plan.sampler_diagnostic else "ALL"
-    return [
+    command = [
         "sbatch",
         "--parsable",
         f"--partition={plan.partition}",
@@ -177,6 +185,9 @@ def sbatch_command(plan: Submission) -> list[str]:
         str(plan.time_minutes),
         plan.commit,
     ]
+    if plan.config_name is not None:
+        command.append(plan.config_name)
+    return command
 
 
 def validate_worktree(plan: Submission) -> None:
@@ -316,12 +327,31 @@ def read_process(pid: int, root: Path = Path("/proc")) -> OwnedProcess | None:
         return None
 
 
-def cleanup_job_ray(marker: str) -> dict:
-    """Terminate only this job's own marked Ray tree, never a shared runtime."""
+def private_ray_marker() -> str:
+    """Identify the current Slurm job or explicitly bounded login debug run."""
     job_id = os.environ.get("SLURM_JOB_ID", "")
+    if os.environ.get("XVLA_LOGIN_TRAINING_DEBUG") == "1":
+        import hashlib
+        import socket
+
+        if "SLURM_JOB_ID" in os.environ or socket.gethostname() != "4090node1":
+            raise RuntimeError("Login Ray cleanup requires 4090node1 outside Slurm")
+        run_id = os.environ.get("XVLA_LOGIN_RUN_ID", "")
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}", run_id) is None:
+            raise ValueError("Set an 8-64 character private XVLA_LOGIN_RUN_ID")
+        seconds = int(os.environ.get("XVLA_LOGIN_SECONDS", "0"))
+        if not 30 <= seconds < 1500 or os.environ.get("XVLA_LOGIN_CPUS") != "4":
+            raise ValueError("Login Ray cleanup requires a bounded four-CPU debug run")
+        key = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+        return f"/tmp/xvla_l_{getpass.getuser()}_{key}"
     if re.fullmatch(r"[0-9]+", job_id) is None:
         raise RuntimeError("Ray cleanup requires a real Slurm job ID")
-    expected = f"/tmp/xvla_rl_{getpass.getuser()}_{job_id}"
+    return f"/tmp/xvla_rl_{getpass.getuser()}_{job_id}"
+
+
+def cleanup_job_ray(marker: str) -> dict:
+    """Terminate only this job's own marked Ray tree, never a shared runtime."""
+    expected = private_ray_marker()
     if marker != expected:
         raise ValueError(
             f"Ray cleanup marker must be this job's private directory: {expected}"
@@ -387,6 +417,7 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cpus", type=int, choices=(8, 16), default=8)
     parser.add_argument("--time-minutes", type=int, default=20)
     parser.add_argument("--sampler-diagnostic", action="store_true")
+    parser.add_argument("--config-name")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 

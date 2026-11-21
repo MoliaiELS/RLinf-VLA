@@ -14,7 +14,9 @@
 
 """Check the short-training submission and job-private process boundaries."""
 
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from dataclasses import replace
@@ -25,8 +27,10 @@ import pytest
 from tools.xvla.online_submit import (
     OwnedProcess,
     Submission,
+    cleanup_job_ray,
     marker_processes,
     parse_queue,
+    private_ray_marker,
     require_submission_capacity,
     sbatch_command,
 )
@@ -89,6 +93,14 @@ def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
     ]
 
 
+@pytest.mark.parametrize("algorithm", ["ppo", "grpo"])
+def test_acceptance_config_is_forwarded_without_changing_default_submission(algorithm):
+    config = replace(plan(), algorithm=algorithm)
+    command = sbatch_command(config)
+    selected = f"robotwin_{algorithm}_xvla_acceptance"
+    assert sbatch_command(replace(config, config_name=selected)) == [*command, selected]
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -104,6 +116,8 @@ def test_sampler_diagnostic_keeps_the_same_bounded_job_resources():
         {"gpu": "all"},
         {"partition": "GPU --exclusive"},
         {"algorithm": "sft"},
+        {"config_name": "robotwin_grpo_xvla_acceptance"},
+        {"config_name": "arbitrary_training"},
     ],
 )
 def test_invalid_paths_or_unbounded_resources_are_rejected(override):
@@ -149,11 +163,110 @@ def test_scoped_cleanup_keeps_other_users_jobs_and_similar_directory_names():
     assert {entry.pid for entry in selected} == {10, 11, 12}
 
 
+def test_cleanup_marker_uses_real_slurm_or_explicit_bounded_login_identity(monkeypatch):
+    monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+    monkeypatch.delenv("XVLA_LOGIN_TRAINING_DEBUG", raising=False)
+    monkeypatch.setattr("getpass.getuser", lambda: "user")
+    with pytest.raises(RuntimeError, match="real Slurm"):
+        private_ray_marker()
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    assert private_ray_marker() == "/tmp/xvla_rl_user_12345"
+    monkeypatch.delenv("SLURM_JOB_ID")
+    monkeypatch.setattr("socket.gethostname", lambda: "4090node1")
+    values = {
+        "XVLA_LOGIN_TRAINING_DEBUG": "1",
+        "XVLA_LOGIN_RUN_ID": "debug_12345",
+        "XVLA_LOGIN_SECONDS": "1200",
+        "XVLA_LOGIN_CPUS": "4",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    key = hashlib.sha256(b"debug_12345").hexdigest()[:16]
+    assert private_ray_marker() == f"/tmp/xvla_l_user_{key}"
+    monkeypatch.setenv("XVLA_LOGIN_RUN_ID", "x" * 64)
+    assert (
+        private_ray_marker()
+        == "/tmp/xvla_l_user_" + hashlib.sha256(b"x" * 64).hexdigest()[:16]
+    )
+    monkeypatch.setenv("XVLA_LOGIN_RUN_ID", values["XVLA_LOGIN_RUN_ID"])
+    with pytest.raises(ValueError, match="this job's private directory"):
+        cleanup_job_ray("/tmp/xvla_l_user_some_other_run")
+    for key, value in (
+        ("XVLA_LOGIN_RUN_ID", "../other"),
+        ("XVLA_LOGIN_SECONDS", "1500"),
+        ("XVLA_LOGIN_CPUS", "8"),
+    ):
+        monkeypatch.setenv(key, value)
+        with pytest.raises(ValueError):
+            private_ray_marker()
+        monkeypatch.setenv(key, values[key])
+    monkeypatch.setenv("SLURM_JOB_ID", "12345")
+    with pytest.raises(RuntimeError, match="outside Slurm"):
+        private_ray_marker()
+    monkeypatch.delenv("SLURM_JOB_ID")
+    monkeypatch.setattr("socket.gethostname", lambda: "4090node2")
+    with pytest.raises(RuntimeError, match="4090node1"):
+        private_ray_marker()
+
+
+def test_login_training_argument_count_and_literal_hydra_forwarding(tmp_path):
+    bash = shutil.which("bash")
+    if bash is None:
+        candidate = Path("C:/Program Files/Git/bin/bash.exe")
+        if not candidate.is_file():
+            pytest.skip("Bash is unavailable for the launcher argument contract")
+        bash = str(candidate)
+    launcher = Path(__file__).resolve().parents[2] / "tools/xvla/login_training.sh"
+    parser = launcher.read_text().split('\nparse_login_training_arguments "$@"', 1)[0]
+    command = (
+        parser
+        + '\nparse_login_training_arguments "$@"\nprintf "%s\\0" "$config" "${hydra_overrides[@]}"'
+    )
+    args = [
+        "/repo",
+        "/venv",
+        "/new-output",
+        "/robotwin",
+        "/model",
+        "GPU-uuid",
+        "ppo",
+        "debug_12345",
+    ]
+    default = subprocess.run([bash, "-c", command, "--", *args], capture_output=True)
+    assert default.returncode == 0
+    assert default.stdout.rstrip(b"\0") == b"robotwin_ppo_xvla_acceptance"
+    overrides = [
+        "runner.resume_dir=/storage/checkpoint with spaces/global_step_3",
+        "runner.max_epochs=4",
+        "runner.max_steps=4",
+        "runner.logger.experiment_name=$(touch unexpected)",
+    ]
+    forwarded = subprocess.run(
+        [bash, "-c", command, "--", *args, "robotwin_ppo_xvla_acceptance", *overrides],
+        capture_output=True,
+        cwd=tmp_path,
+    )
+    assert forwarded.returncode == 0
+    assert forwarded.stdout.rstrip(b"\0").decode().split("\0") == [
+        "robotwin_ppo_xvla_acceptance",
+        *overrides,
+    ]
+    assert not list(tmp_path.iterdir())
+    for invalid in (args[:-1], [*args, "robotwin_grpo_xvla_acceptance"]):
+        rejected = subprocess.run(
+            [bash, "-c", command, "--", *invalid], capture_output=True
+        )
+        assert rejected.returncode == 2
+
+
 @pytest.mark.parametrize("sampler_diagnostic", [False, True])
+@pytest.mark.parametrize("config_name", [None, "robotwin_ppo_xvla_acceptance"])
 def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
-    tmp_path, sampler_diagnostic
+    tmp_path, sampler_diagnostic, config_name
 ):
-    config = replace(plan(), sampler_diagnostic=sampler_diagnostic)
+    config = replace(
+        plan(), sampler_diagnostic=sampler_diagnostic, config_name=config_name
+    )
     script = Path(__file__).resolve().parents[2] / "tools/xvla/online_submit.py"
     args = []
     for field in (
@@ -168,6 +281,8 @@ def test_dry_run_prints_the_exact_plan_without_git_or_slurm(
         args.extend(("--" + field.replace("_", "-"), str(getattr(config, field))))
     if sampler_diagnostic:
         args.append("--sampler-diagnostic")
+    if config_name is not None:
+        args.extend(("--config-name", config_name))
     completed = subprocess.run(
         [sys.executable, str(script), *args, "--dry-run"],
         check=True,
